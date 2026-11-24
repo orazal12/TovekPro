@@ -59,6 +59,8 @@ pub const COMPACT_ANNOTATIONS: u32 = 1 << 6;
 pub const COMPACT_STYLE: u32 = 1 << 7;
 /// Write folded library constants through Roblox's standard libraries.
 pub const ASSUME_STANDARD_LIBRARIES: u32 = 1 << 8;
+/// Omit decompiler diagnostic comments (`-- inferred equivalent call`, `-- parallel`, `[DEDUP]`).
+pub const CLEAN_COMMENTS: u32 = 1 << 9;
 
 #[doc(hidden)]
 pub use ast::prof;
@@ -89,6 +91,9 @@ pub struct DecompileOptions {
     /// `Vector3.new(...)`. The exact default does not look anything up in the
     /// environment, which another script may replace at run time.
     pub assume_standard_libraries: bool,
+    /// Opt-in: omit decompiler diagnostic comments (`-- inferred equivalent call`,
+    /// `-- parallel`, `[DEDUP]`) while preserving `--!native` directives.
+    pub clean_comments: bool,
 }
 
 /// Controls whether the certified CFG dispatcher is an acceptable output
@@ -103,8 +108,21 @@ pub enum ControlFlowOutputPolicy {
 }
 
 impl DecompileOptions {
+    /// TovekPro maximum-readability preset: compact if-expressions, standard
+    /// library constants (`math.pi`, `math.huge`, `Vector3.zero`/axes), NaN-free
+    /// comparisons (`a >= b`), and clean comment-free source.
+    pub fn pro() -> Self {
+        Self {
+            assume_no_nan: true,
+            compact_style: true,
+            assume_standard_libraries: true,
+            clean_comments: true,
+            ..Self::default()
+        }
+    }
+
     pub fn from_flag_bits(bits: u32) -> Option<Self> {
-        if bits & !(DONT_REUSE_VAR | NO_SYNTH_HELPERS | ASSUME_NO_NAN | STRICT_NO_SYNTHETIC_CONTROL | EMIT_BINDING_PROVENANCE | SYNTHESIZE_ARITHMETIC_LOOPS | COMPACT_ANNOTATIONS | COMPACT_STYLE | ASSUME_STANDARD_LIBRARIES)
+        if bits & !(DONT_REUSE_VAR | NO_SYNTH_HELPERS | ASSUME_NO_NAN | STRICT_NO_SYNTHETIC_CONTROL | EMIT_BINDING_PROVENANCE | SYNTHESIZE_ARITHMETIC_LOOPS | COMPACT_ANNOTATIONS | COMPACT_STYLE | ASSUME_STANDARD_LIBRARIES | CLEAN_COMMENTS)
             != 0
         {
             return None;
@@ -118,6 +136,7 @@ impl DecompileOptions {
             compact_annotations: bits & COMPACT_ANNOTATIONS != 0,
             compact_style: bits & COMPACT_STYLE != 0,
             assume_standard_libraries: bits & ASSUME_STANDARD_LIBRARIES != 0,
+            clean_comments: bits & CLEAN_COMMENTS != 0,
             control_flow_policy: if bits & STRICT_NO_SYNTHETIC_CONTROL != 0 {
                 ControlFlowOutputPolicy::StrictNoSyntheticControl
             } else {
@@ -135,6 +154,7 @@ impl DecompileOptions {
             | u32::from(self.compact_annotations) * COMPACT_ANNOTATIONS
             | u32::from(self.compact_style) * COMPACT_STYLE
             | u32::from(self.assume_standard_libraries) * ASSUME_STANDARD_LIBRARIES
+            | u32::from(self.clean_comments) * CLEAN_COMMENTS
             | u32::from(
                 self.control_flow_policy == ControlFlowOutputPolicy::StrictNoSyntheticControl,
             ) * STRICT_NO_SYNTHETIC_CONTROL
@@ -150,6 +170,7 @@ impl DecompileOptions {
             compact_annotations: self.compact_annotations || other.compact_annotations,
             compact_style: self.compact_style || other.compact_style,
             assume_standard_libraries: self.assume_standard_libraries || other.assume_standard_libraries,
+            clean_comments: self.clean_comments || other.clean_comments,
             control_flow_policy: if self.control_flow_policy
                 == ControlFlowOutputPolicy::StrictNoSyntheticControl
                 || other.control_flow_policy == ControlFlowOutputPolicy::StrictNoSyntheticControl
@@ -1336,6 +1357,13 @@ fn decompile_bytecode_internal(
                 ptime!(S_ELIMINATE_NIL);
                 ast::eliminate_nil::eliminate_redundant_nil(&mut body);
             }
+            // Second OOP method-recovery pass: catch methods whose receiver or
+            // prefix aliases (`Promise.prototype._resolve`) collapsed during
+            // `inline_temps`, `rebuild_ui_expression_trees`, and `copy_cleanup`.
+            {
+                ptime!(S_RECOVER_METHODS);
+                ast::recover_methods::recover_methods(&mut body);
+            }
             // Expression-level de-inline (proposal §7): recover small pure scalar
             // helpers that `-O2` inlined as a sub-expression of a caller's
             // condition/RValue. Runs before normalize_conditions: the
@@ -1348,6 +1376,10 @@ fn decompile_bytecode_internal(
                 ast::expr_deinline::expr_deinline(&mut body);
             }
             dump_stage("expression_deinline", &body);
+            // Re-run self-guard folding now that `inline_temps`, `copy_cleanup`,
+            // `reconstruct_short_circuit_expressions`, and `expr_deinline` have
+            // simplified branch conditions (e.g. `local v = a; if v then v = not (b and c) end`).
+            ast::conditional_expressions::fold_self_guards(&mut body);
             // Balance only after expression de-inline has had the original
             // scalar tree available for helper matching. Expanding a long
             // conditional before this point would hide recoverable helpers such
@@ -1593,8 +1625,21 @@ fn decompile_bytecode_internal(
             let (out, source_occurrences, emission_map) = {
                 ptime!(S_FORMAT);
                 if emit_upvalue_analysis {
-                    ast::formatter::format_with_emission_map_options(&body, Default::default(), options.emit_binding_provenance, options.compact_annotations)
-                        .map_err(|_| DecompileFailure::message("formatting failed"))?
+                    ast::formatter::format_with_emission_map_full(
+                        &body,
+                        Default::default(),
+                        options.emit_binding_provenance,
+                        options.compact_annotations,
+                        options.clean_comments,
+                    )
+                    .map_err(|_| DecompileFailure::message("formatting failed"))?
+                } else if options.clean_comments {
+                    (
+                        ast::formatter::format_clean(&body, Default::default())
+                            .map_err(|_| DecompileFailure::message("formatting failed"))?,
+                        Vec::new(),
+                        Default::default(),
+                    )
                 } else {
                     (body.to_string(), Vec::new(), Default::default())
                 }

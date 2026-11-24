@@ -1,7 +1,7 @@
 --!nocheck
 -- decompile.client.luau
 --
--- Executor-side client for the Medal Luau decompiler web server (run-server.ps1).
+-- Executor-side client for the TovekPro Luau decompiler web server (run-server.ps1).
 -- Installs a `getgenv().decompile(script)` hook that ships each script's bytecode
 -- to the local server, then drives SynSaveInstance in "scripts" mode so every
 -- LocalScript / ModuleScript in the game is decompiled through it.
@@ -11,6 +11,7 @@
 -- after the in-game script path — e.g. UI module require() paths resolve nicely.
 
 local SERVER_URL = "http://localhost:3000/decompile"
+local USE_PRO_MODE = true -- sends `X-Decompile-Flags: PRO` (compact style, stdlib constants, clean comments)
 
 -- Resolve the executor's HTTP request function (names differ per executor).
 local httpRequest = request or http_request or (syn and syn.request) or (http and http.request)
@@ -43,6 +44,7 @@ getgenv().decompile = function(script_instance)
         Headers = {
             -- The script's full path — the API uses this to name the chunk.
             ["X-Script-Name"] = script_instance:GetFullName(),
+            ["X-Decompile-Flags"] = USE_PRO_MODE and "PRO" or "NONE",
         },
         Body = encoded,
     })

@@ -250,7 +250,8 @@ fn foldable_anywhere(statements: &[Statement]) -> bool {
     statements.iter().enumerate().any(|(index, statement)| {
         if let Some(local) = candidate_decl(statement)
             && let Some(Statement::If(r#if)) = statements.get(index + 1)
-            && branch_assignments(r#if, &local).is_some()
+            && (branch_assignments(r#if, &local).is_some()
+                || short_circuit_chain(r#if, &local, 0).is_some())
         {
             return true;
         }
@@ -391,20 +392,13 @@ fn reconstruct_at(block: &mut Block, decl_index: usize, if_index: usize, use_ind
     let Some(local_usage) = usage.get(&local) else {
         return Fold::None;
     };
-    if local_usage.reads != 1 || local_usage.writes != 3 || local_usage.captured {
+    if local_usage.reads != 1 || local_usage.captured {
         return Fold::None;
     }
 
     let Statement::If(r#if) = &block.0[if_index] else {
         return Fold::None;
     };
-    let Some((condition, then_value, else_value)) = branch_assignments(r#if, &local) else {
-        return Fold::None;
-    };
-    if contains_unsupported_value(&then_value) || contains_unsupported_value(&else_value) {
-        return Fold::None;
-    }
-
     if replaceable_direct_rvalue_read_count(&block.0[use_index], &local) != 1 {
         return Fold::None;
     }
@@ -414,13 +408,31 @@ fn reconstruct_at(block: &mut Block, decl_index: usize, if_index: usize, use_ind
     if !is_generated_temp(&local) && use_context != UseContext::IndexReceiver {
         return Fold::None;
     }
-    if !complexity_allowed(&condition, &then_value, &else_value) {
-        return Fold::None;
-    }
 
-    let replacement = if allow_if_expression {
-        select_expression(condition, then_value, else_value)
-    } else if let Some(value) = build_short_circuit(condition, then_value, else_value) {
+    let replacement = if let Some((condition, then_value, else_value)) =
+        branch_assignments(r#if, &local)
+    {
+        if local_usage.writes != 3
+            || contains_unsupported_value(&then_value)
+            || contains_unsupported_value(&else_value)
+            || !complexity_allowed(&condition, &then_value, &else_value)
+        {
+            return Fold::None;
+        }
+        if allow_if_expression {
+            select_expression(condition, then_value, else_value)
+        } else if let Some(value) = build_short_circuit(condition, then_value, else_value) {
+            value
+        } else {
+            return Fold::None;
+        }
+    } else if let Some((value, arm_writes)) = short_circuit_chain(r#if, &local, 0) {
+        if local_usage.writes != 1 + arm_writes
+            || contains_unsupported_value(&value)
+            || crate::expression_budget::expression_cost(&value) > 80
+        {
+            return Fold::None;
+        }
         value
     } else {
         return Fold::None;
@@ -456,7 +468,7 @@ fn reconstruct_once(block: &mut Block, allow_if_expression: bool) -> bool {
         let Some(local_usage) = usage.get(&local) else {
             continue;
         };
-        if local_usage.reads != 1 || local_usage.writes != 3 || local_usage.captured {
+        if local_usage.reads != 1 || local_usage.captured {
             continue;
         }
 
@@ -464,13 +476,6 @@ fn reconstruct_once(block: &mut Block, allow_if_expression: bool) -> bool {
         let Statement::If(r#if) = &block.0[if_index] else {
             continue;
         };
-        let Some((condition, then_value, else_value)) = branch_assignments(r#if, &local) else {
-            continue;
-        };
-        if contains_unsupported_value(&then_value) || contains_unsupported_value(&else_value) {
-            continue;
-        }
-
         let use_index = if_index + 1;
         if replaceable_direct_rvalue_read_count(&block.0[use_index], &local) != 1 {
             continue;
@@ -481,13 +486,30 @@ fn reconstruct_once(block: &mut Block, allow_if_expression: bool) -> bool {
         if !is_generated_temp(&local) && use_context != UseContext::IndexReceiver {
             continue;
         }
-        if !complexity_allowed(&condition, &then_value, &else_value) {
-            continue;
-        }
-
-        let replacement = if allow_if_expression {
-            select_expression(condition, then_value, else_value)
-        } else if let Some(value) = build_short_circuit(condition, then_value, else_value) {
+        let replacement = if let Some((condition, then_value, else_value)) =
+            branch_assignments(r#if, &local)
+        {
+            if local_usage.writes != 3
+                || contains_unsupported_value(&then_value)
+                || contains_unsupported_value(&else_value)
+                || !complexity_allowed(&condition, &then_value, &else_value)
+            {
+                continue;
+            }
+            if allow_if_expression {
+                select_expression(condition, then_value, else_value)
+            } else if let Some(value) = build_short_circuit(condition, then_value, else_value) {
+                value
+            } else {
+                continue;
+            }
+        } else if let Some((value, arm_writes)) = short_circuit_chain(r#if, &local, 0) {
+            if local_usage.writes != 1 + arm_writes
+                || contains_unsupported_value(&value)
+                || crate::expression_budget::expression_cost(&value) > 80
+            {
+                continue;
+            }
             value
         } else {
             continue;
@@ -532,6 +554,28 @@ fn branch_assignments(r#if: &If, local: &RcLocal) -> Option<(RValue, RValue, RVa
     let then_value = single_local_assignment_value(&r#if.then_block.lock(), local)?;
     let else_value = single_local_assignment_value(&r#if.else_block.lock(), local)?;
     Some((r#if.condition.clone(), then_value, else_value))
+}
+
+/// Collapse a multi-arm boolean `if / elseif / else` assignment chain into a
+/// value-exact short-circuit `and`/`or`/`not` expression:
+/// `if a then v = true elseif b then v = c else v = false end` -> `a or (b and c)`.
+/// Returns `(expression, arm_write_count)`.
+fn short_circuit_chain(r#if: &If, local: &RcLocal, depth: usize) -> Option<(RValue, usize)> {
+    if depth >= 4 {
+        return None;
+    }
+    let then_value = single_local_assignment_value(&r#if.then_block.lock(), local)?;
+    let else_block = r#if.else_block.lock();
+    let (else_value, else_writes) =
+        if let Some(value) = single_local_assignment_value(&else_block, local) {
+            (value, 1)
+        } else if let [Statement::If(nested)] = else_block.0.as_slice() {
+            short_circuit_chain(nested, local, depth + 1)?
+        } else {
+            return None;
+        };
+    let expr = build_short_circuit(r#if.condition.clone(), then_value, else_value)?;
+    Some((expr, 1 + else_writes))
 }
 
 fn single_local_assignment_value(block: &Block, local: &RcLocal) -> Option<RValue> {

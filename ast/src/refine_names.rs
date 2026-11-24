@@ -350,10 +350,37 @@ fn module_leaf(value: &RValue) -> Option<String> {
 }
 
 // Assertion messages must name exactly one identifier, and the guard must
-// refer to exactly one local through supported expressions. No free-text guess.
+// refer to exactly one local through supported expressions. Supports both
+// backtick-quoted `` `name` `` and canonical single-subject phrases like
+// `"traceback is nil"` / `"callback must be a function"`.
 fn assertion_name(message: &str) -> Option<&str> {
     let parts: Vec<_> = message.split('`').take(4).collect();
-    (parts.len() == 3 && useful(parts[1])).then(|| parts[1])
+    if parts.len() == 3 && useful(parts[1]) {
+        return Some(parts[1]);
+    }
+    if parts.len() == 1 {
+        let trimmed = message.trim();
+        let word = trimmed.split_whitespace().next()?;
+        let rest = trimmed.get(word.len()..)?.trim_start();
+        let canonical = rest.starts_with("is nil")
+            || rest.starts_with("must be ")
+            || rest.starts_with("cannot be ")
+            || rest.starts_with("should be ")
+            || rest.starts_with("must not be ");
+        let stopword = matches!(
+            word.to_ascii_lowercase().as_str(),
+            "it" | "this" | "that" | "there" | "argument" | "arg" | "value" | "parameter"
+                | "param" | "first" | "second" | "third" | "the" | "a" | "an" | "expected"
+        );
+        if canonical
+            && !stopword
+            && word.starts_with(|c: char| c.is_ascii_lowercase())
+            && useful(word)
+        {
+            return Some(word);
+        }
+    }
+    None
 }
 
 fn guard_local(value: &RValue, depth: usize) -> Option<u64> {
@@ -591,8 +618,19 @@ impl Graph {
         let (Some(key), RValue::Local(local)) = (string(key), value) else {
             return;
         };
-        let Some(name) = field_role(key) else {
-            return;
+        let is_pascal_class_table = self.tables.contains(&local.stable_id())
+            && key.starts_with(|c: char| c.is_ascii_uppercase())
+            && key.contains(|c: char| c.is_ascii_lowercase())
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !crate::name_spelling::soft_reserved(key)
+            && crate::formatter::Formatter::<std::fmt::Formatter>::is_valid_name(key.as_bytes());
+        let name = if is_pascal_class_table {
+            key.to_string()
+        } else {
+            let Some(name) = field_role(key) else {
+                return;
+            };
+            name
         };
         self.node(local);
         self.candidate(
@@ -843,18 +881,37 @@ impl Graph {
                                 if let RValue::Closure(closure) = right {
                                     self.closures.insert(local.stable_id(), closure.function.0.clone());
                                     let function = closure.function.lock();
-                                    let returns = (function.body.len() <= self.options.node_budget && function.parameters.len() <= self.options.binding_budget).then(|| function.body.last()).flatten().and_then(|tail| {
-                                        let Statement::Return(ret) = tail else { return None; };
-                                        if function.body.iter().take(function.body.len() - 1).any(|s| !matches!(s,
-                                            Statement::Assign(_) | Statement::Call(_) | Statement::MethodCall(_))) {
-                                            return None;
-                                        }
-                                        ret.values.iter().map(|value| match value {
-                                            RValue::Local(local) => Some(ReturnRole::Binding(local.stable_id())),
-                                            RValue::Index(index) => string(&index.right).and_then(field_role).map(ReturnRole::Field),
-                                            _ => None,
-                                        }).collect::<Option<Vec<_>>>()
-                                    });
+                                    let returns = (function.body.len() <= self.options.node_budget
+                                        && function.parameters.len() <= self.options.binding_budget)
+                                        .then(|| function.body.last())
+                                        .flatten()
+                                        .and_then(|tail| {
+                                            let Statement::Return(ret) = tail else { return None; };
+                                            let arity = ret.values.len();
+                                            let prefix_ok = function.body.iter().take(function.body.len() - 1).all(|s| match s {
+                                                Statement::Assign(_) | Statement::Call(_) | Statement::MethodCall(_) => true,
+                                                Statement::If(branch) => {
+                                                    let then_block = branch.then_block.lock();
+                                                    let else_block = branch.else_block.lock();
+                                                    else_block.0.is_empty()
+                                                        && matches!(
+                                                            then_block.0.as_slice(),
+                                                            [Statement::Return(early)]
+                                                                if early.values.len() == arity
+                                                                    && early.values.iter().all(|v| matches!(v, RValue::Literal(Literal::Nil)))
+                                                        )
+                                                }
+                                                _ => false,
+                                            });
+                                            if !prefix_ok {
+                                                return None;
+                                            }
+                                            ret.values.iter().map(|value| match value {
+                                                RValue::Local(local) => Some(ReturnRole::Binding(local.stable_id())),
+                                                RValue::Index(index) => string(&index.right).and_then(field_role).map(ReturnRole::Field),
+                                                _ => None,
+                                            }).collect::<Option<Vec<_>>>()
+                                        });
                                     self.functions.insert(local.stable_id(), FunctionRoles {
                                         parameters: function.parameters.iter().map(RcLocal::stable_id).collect(),
                                         returns, variadic: function.is_variadic,

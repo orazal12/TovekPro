@@ -6,7 +6,7 @@
 use std::fmt::{self, Write};
 
 use super::{FlatWidth, Formatter, IndentationMode, PREFERRED_LINE_WIDTH};
-use crate::{BinaryOperation, Literal, RValue, Select, Table, UnaryOperation};
+use crate::{BinaryOperation, Literal, RValue, Select, Table, Traverse, UnaryOperation};
 
 /// A table printed on one line by the short-table rule ends by this column.
 const ONE_LINE_TABLE_COLUMN: usize = 100;
@@ -109,6 +109,7 @@ impl<W: fmt::Write> Formatter<'_, W> {
             emission_map: None,
             layout_budget: Some(256),
             compact_annotations: self.compact_annotations,
+            clean_comments: self.clean_comments,
             inferred_calls: Default::default(),
         };
         let fits = render(&mut preview).is_ok();
@@ -133,8 +134,20 @@ impl<W: fmt::Write> Formatter<'_, W> {
         arguments: &[RValue],
         render: impl Fn(&mut Formatter<'_, FlatWidth>, Arguments) -> fmt::Result,
     ) -> Arguments {
-        if self.layout_budget.is_some() || arguments.len() < 2 {
+        if self.layout_budget.is_some() || arguments.is_empty() {
             return Arguments::Flat;
+        }
+        if arguments.len() == 1 {
+            if !matches!(arguments[0], RValue::Binary(_)) {
+                return Arguments::Flat;
+            }
+            let room = PREFERRED_LINE_WIDTH.saturating_sub(self.column()).max(MIN_GROUP_WIDTH);
+            let preview = self.preview(room, |preview| render(preview, Arguments::Flat));
+            return if preview.fits || preview.multiline {
+                Arguments::Flat
+            } else {
+                Arguments::Lines
+            };
         }
         let room = PREFERRED_LINE_WIDTH.saturating_sub(self.column()).max(MIN_GROUP_WIDTH);
         let fits = |layout| {
@@ -307,7 +320,28 @@ impl<W: fmt::Write> Formatter<'_, W> {
             }
             Ok(())
         });
-        (!preview.fits && !preview.multiline).then(|| Spine::of(value)).flatten()
+        if !preview.fits {
+            if !preview.multiline {
+                return Spine::of(value);
+            }
+            // Also break an overflowing `and`/`or` spine when one of its terms
+            // happens to be a multiline call (e.g. `a or b < math.max(\n...\n)`),
+            // as long as the spine contains no closure or table literal.
+            let mut has_block_literal = false;
+            fn walk(v: &RValue, found: &mut bool) {
+                if *found { return; }
+                if matches!(v, RValue::Closure(_) | RValue::Table(_)) {
+                    *found = true;
+                    return;
+                }
+                v.visit_rvalues(&mut |child| { walk(child, found); !*found });
+            }
+            walk(value, &mut has_block_literal);
+            if !has_block_literal {
+                return Spine::of(value);
+            }
+        }
+        None
     }
 
     fn format_operand(&mut self, operand: &RValue, parenthesized: bool) -> fmt::Result {

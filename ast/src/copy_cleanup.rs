@@ -89,7 +89,7 @@ fn cleanup_current_block(block: &mut Block, captured: &mut FxHashSet<RcLocal>, f
     let mut usage = FxHashMap::<RcLocal, Usage>::default();
     let mut sites = FxHashMap::<RcLocal, BTreeSet<usize>>::default();
     let mut runtime_reads = FxHashMap::<RcLocal, BTreeSet<usize>>::default();
-    let mut last_writes = FxHashMap::default();
+    let mut write_sites = FxHashMap::<RcLocal, BTreeSet<usize>>::default();
     let mut declarations = FxHashMap::default();
     for (index, statement) in block.iter().enumerate() {
         let mut local_usage = FxHashMap::default();
@@ -101,7 +101,7 @@ fn cleanup_current_block(block: &mut Block, captured: &mut FxHashSet<RcLocal>, f
             total.captured |= counts.captured;
             sites.entry(local).or_default().insert(index);
         }
-        index_runtime_sites(statement, index, &mut runtime_reads, &mut last_writes);
+        index_runtime_sites(statement, index, &mut runtime_reads, &mut write_sites);
         if let Statement::Assign(assign) = statement && assign.prefix {
             for local in assign.left.iter().filter_map(LValue::as_local) {
                 declarations.entry(local.clone()).or_insert(index);
@@ -111,9 +111,26 @@ fn cleanup_current_block(block: &mut Block, captured: &mut FxHashSet<RcLocal>, f
     let mut removed = vec![false; block.len()];
     while let Some(index) = pending.pop_first() {
         let Some((dst, src)) = candidate_copy(&block[index]) else { continue; };
-        if !copy_is_removable(&dst, &src, &usage)
-            || last_writes.get(&src).is_some_and(|&written| written > index) { continue; }
+        if !copy_is_removable(&dst, &src, &usage) { continue; }
         let dst_was_captured = usage[&dst].captured;
+        // If `dst` is captured by a closure, `src` must not be written anywhere
+        // after `index`. Otherwise `dst`'s runtime reads bound its live window:
+        // a later write to `src` strictly after `dst`'s last read cannot affect `dst`.
+        let src_clobbered = if dst_was_captured {
+            write_sites
+                .get(&src)
+                .is_some_and(|ws| ws.range((index + 1)..).next().is_some())
+        } else {
+            let last_read = runtime_reads
+                .get(&dst)
+                .and_then(|rs| rs.last().copied())
+                .unwrap_or(index);
+            last_read > index
+                && write_sites
+                    .get(&src)
+                    .is_some_and(|ws| ws.range((index + 1)..=last_read).next().is_some())
+        };
+        if src_clobbered { continue; }
         if dst_was_captured && (captured.contains(&src)
             || (!function_root && !declarations.get(&src).is_some_and(|&at| at < index))) { continue; }
         if captured.contains(&src)
@@ -144,7 +161,7 @@ fn cleanup_current_block(block: &mut Block, captured: &mut FxHashSet<RcLocal>, f
         // Remove `local dst = src`, then redirect every remaining read of dst.
         source.reads = source.reads - 1 + destination.reads;
         source.captured |= destination.captured;
-        last_writes.remove(&dst);
+        write_sites.remove(&dst);
         declarations.remove(&dst);
         if let Some(&source_declaration) = declarations.get(&src) {
             pending.insert(source_declaration);
@@ -162,10 +179,10 @@ fn index_runtime_sites(
     statement: &Statement,
     index: usize,
     reads: &mut FxHashMap<RcLocal, BTreeSet<usize>>,
-    writes: &mut FxHashMap<RcLocal, usize>,
+    writes: &mut FxHashMap<RcLocal, BTreeSet<usize>>,
 ) {
     statement.visit_local_reads(&mut |local| { reads.entry(local.clone()).or_default().insert(index); true });
-    for local in statement.values_written() { writes.insert(local.clone(), index); }
+    for local in statement.values_written() { writes.entry(local.clone()).or_default().insert(index); }
     let mut child = |block: &Block| {
         for statement in &block.0 { index_runtime_sites(statement, index, reads, writes); }
     };
@@ -249,10 +266,10 @@ fn cleanup_once(block: &mut Block, captured: &mut FxHashSet<RcLocal>, function_r
         if !copy_is_removable(&dst, &src, &usage) {
             continue;
         }
-        if src_written_after(block, index, &src) {
+        let dst_was_captured = usage.get(&dst).is_some_and(|usage| usage.captured);
+        if src_written_in_window(block, index, &dst, &src, dst_was_captured) {
             continue;
         }
-        let dst_was_captured = usage.get(&dst).is_some_and(|usage| usage.captured);
         // A captured alias is removable when its source was not already an
         // externally mutable cell and is never written after the snapshot.
         // Rewriting the closure's upvalue from `dst` to `src` then preserves the
@@ -420,10 +437,27 @@ fn captured_src_mutated_before_use(block: &Block, decl_index: usize, dst: &RcLoc
 /// whole-remainder check is sound (a closure can no longer hide a write to
 /// `src`).
 #[cfg(test)]
-fn src_written_after(block: &Block, decl_index: usize, src: &RcLocal) -> bool {
+fn src_written_in_window(
+    block: &Block,
+    decl_index: usize,
+    dst: &RcLocal,
+    src: &RcLocal,
+    dst_was_captured: bool,
+) -> bool {
     let mut set = FxHashSet::default();
     set.insert(src.clone());
-    block.0[decl_index + 1..]
+    let end = if dst_was_captured {
+        block.0.len()
+    } else {
+        match (decl_index + 1..block.0.len())
+            .rev()
+            .find(|&i| reads_local_deep(&block.0[i], dst))
+        {
+            Some(last_read) => last_read + 1,
+            None => return false,
+        }
+    };
+    block.0[decl_index + 1..end]
         .iter()
         .any(|statement| crate::inline_temps::statement_writes_any_local(statement, &set))
 }

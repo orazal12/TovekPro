@@ -24,7 +24,7 @@ impl Flow {
 }
 
 pub fn cleanup_control_flow(block: &mut Block) {
-    cleanup_block(block, false);
+    cleanup_block(block, false, false);
 }
 
 fn trivia(statement: &Statement) -> bool {
@@ -66,13 +66,13 @@ fn return_guard(statement: &Statement) -> Option<Statement> {
 
 fn cleanup_value(value: &mut RValue) {
     if let RValue::Closure(closure) = value {
-        cleanup_block(&mut closure.function.lock().body, false);
+        cleanup_block(&mut closure.function.lock().body, false, false);
     } else {
         value.visit_rvalues_mut(&mut |child| { cleanup_value(child); true });
     }
 }
 
-fn cleanup_block(block: &mut Block, else_arm: bool) -> Flow {
+fn cleanup_block(block: &mut Block, else_arm: bool, in_repeat_body: bool) -> Flow {
     // Keep an existing elseif chain together. Its children are still visited.
     let elseif = else_arm && singleton_if(block);
     let mut flow = Flow::default();
@@ -86,18 +86,19 @@ fn cleanup_block(block: &mut Block, else_arm: bool) -> Flow {
         let mut after_loop = None;
         match &mut statement {
             Statement::If(branch) => {
-                let then_flow = cleanup_block(&mut branch.then_block.lock(), false);
-                let else_flow = cleanup_block(&mut branch.else_block.lock(), true);
+                let then_flow = cleanup_block(&mut branch.then_block.lock(), false, false);
+                let else_flow = cleanup_block(&mut branch.else_block.lock(), true, false);
                 flow.include(then_flow);
                 flow.include(else_flow);
+                let is_last = Some(index) == last;
                 let lift = !elseif && !then_flow.unstructured && !else_flow.unstructured
                     && terminates(&branch.then_block.lock())
                     && {
                         let otherwise = branch.else_block.lock();
                         !otherwise.0.iter().all(trivia)
                             && !singleton_if(&otherwise)
-                            && !declares_local(&otherwise)
-                            && (Some(index) == last || !terminates(&otherwise))
+                            && ((!declares_local(&otherwise)) || (is_last && !in_repeat_body))
+                            && (is_last || !terminates(&otherwise))
                     };
                 if lift {
                     let tail = std::mem::take(&mut branch.else_block.lock().0);
@@ -107,7 +108,7 @@ fn cleanup_block(block: &mut Block, else_arm: bool) -> Flow {
                 }
             }
             Statement::While(node) => {
-                let body_flow = cleanup_block(&mut node.block.lock(), false);
+                let body_flow = cleanup_block(&mut node.block.lock(), false, false);
                 flow.unstructured |= body_flow.unstructured;
                 if matches!(node.condition, RValue::Literal(Literal::Boolean(true)))
                     && !body_flow.unstructured
@@ -169,13 +170,13 @@ fn cleanup_block(block: &mut Block, else_arm: bool) -> Flow {
                 }
             }
             Statement::Repeat(node) => {
-                flow.unstructured |= cleanup_block(&mut node.block.lock(), false).unstructured;
+                flow.unstructured |= cleanup_block(&mut node.block.lock(), false, true).unstructured;
             }
             Statement::NumericFor(node) => {
-                flow.unstructured |= cleanup_block(&mut node.block.lock(), false).unstructured;
+                flow.unstructured |= cleanup_block(&mut node.block.lock(), false, false).unstructured;
             }
             Statement::GenericFor(node) => {
-                flow.unstructured |= cleanup_block(&mut node.block.lock(), false).unstructured;
+                flow.unstructured |= cleanup_block(&mut node.block.lock(), false, false).unstructured;
             }
             Statement::Break(_) => flow.breaks += 1,
             Statement::Continue(_) => flow.continues = true,

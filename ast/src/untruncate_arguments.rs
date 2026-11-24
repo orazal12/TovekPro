@@ -37,7 +37,17 @@ pub fn untruncate_arguments(body: &mut Block, standard_libraries: bool) {
     crate::expr_deinline::collect_write_counts(&body.0, &mut writes);
     let mut parameters = FxHashMap::default();
     let mut one_valued = FxHashSet::default();
-    local_functions(&body.0, &writes, &mut parameters, &mut one_valued);
+    let error_trusted = standard_libraries && !local_or_global_shadows_error(&body.0);
+    let mut forward_nil_decls = FxHashSet::default();
+    collect_forward_nil_decls(&body.0, &mut forward_nil_decls);
+    local_functions(
+        &body.0,
+        &writes,
+        &forward_nil_decls,
+        error_trusted,
+        &mut parameters,
+        &mut one_valued,
+    );
     let arity = |callee: &RValue| match callee {
         RValue::Local(local) => parameters.get(local).copied(),
         _ => None,
@@ -49,6 +59,159 @@ pub fn untruncate_arguments(body: &mut Block, standard_libraries: bool) {
     block(&mut body.0, &arity, &one);
 }
 
+fn local_or_global_shadows_error(stmts: &[Statement]) -> bool {
+    let is_error_local = |local: &RcLocal| local.0 .0.lock().0.as_deref() == Some("error");
+    for statement in stmts {
+        match statement {
+            Statement::Assign(assign) => {
+                for target in &assign.left {
+                    match target {
+                        LValue::Local(local) if is_error_local(local) => return true,
+                        LValue::Global(global) if global.0.as_slice() == b"error" => return true,
+                        _ => {}
+                    }
+                }
+            }
+            Statement::NumericFor(numeric_for) => {
+                if is_error_local(&numeric_for.counter) {
+                    return true;
+                }
+            }
+            Statement::GenericFor(generic_for) => {
+                if generic_for.res_locals.iter().any(&is_error_local) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        let mut found = false;
+        for_each_block(statement, &mut |nested| {
+            found |= local_or_global_shadows_error(nested);
+        });
+        if found {
+            return true;
+        }
+        crate::deinline::visit_stmt_rvalues(statement, &mut |value| {
+            closures_with_fn(value, &mut |function| {
+                if function.parameters.iter().any(&is_error_local)
+                    || local_or_global_shadows_error(&function.body.0)
+                {
+                    found = true;
+                }
+            });
+            !found
+        });
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
+fn closures_with_fn(value: &RValue, f: &mut impl FnMut(&crate::Function)) {
+    if let RValue::Closure(closure) = value {
+        f(&closure.function.lock());
+    }
+    value.visit_rvalues(&mut |child| {
+        closures_with_fn(child, f);
+        true
+    });
+}
+
+fn collect_forward_nil_decls(stmts: &[Statement], out: &mut FxHashSet<RcLocal>) {
+    for statement in stmts {
+        if let Statement::Assign(assign) = statement
+            && assign.prefix
+            && let [LValue::Local(local)] = assign.left.as_slice()
+            && (assign.right.is_empty()
+                || matches!(assign.right.as_slice(), [RValue::Literal(crate::Literal::Nil)]))
+        {
+            out.insert(local.clone());
+        }
+        for_each_block(statement, &mut |nested| collect_forward_nil_decls(nested, out));
+        crate::deinline::visit_stmt_rvalues(statement, &mut |value| {
+            closures(value, &mut |body| collect_forward_nil_decls(&body.0, out));
+            true
+        });
+    }
+}
+
+/// Returns true if every non-diverging path through `stmts` ends in a
+/// 1-value `return`, treating tail `error(...)` calls as diverging when
+/// `error_trusted` (`--assume-standard-libraries` with unshadowed `error`).
+fn returns_exactly_one_with_error(stmts: &[Statement], error_trusted: bool) -> bool {
+    if crate::deinline::returns_exactly_one(stmts) {
+        return true;
+    }
+    if !error_trusted {
+        return false;
+    }
+    fn all_returns_one(stmts: &[Statement]) -> bool {
+        for stmt in stmts {
+            match stmt {
+                Statement::Return(ret) => {
+                    if ret.values.len() != 1
+                        || matches!(
+                            ret.values.first(),
+                            Some(RValue::Call(_) | RValue::MethodCall(_) | RValue::VarArg(_))
+                        )
+                    {
+                        return false;
+                    }
+                }
+                Statement::If(r#if) => {
+                    if !all_returns_one(&r#if.then_block.lock().0)
+                        || !all_returns_one(&r#if.else_block.lock().0)
+                    {
+                        return false;
+                    }
+                }
+                Statement::While(w) => {
+                    if !all_returns_one(&w.block.lock().0) {
+                        return false;
+                    }
+                }
+                Statement::Repeat(r) => {
+                    if !all_returns_one(&r.block.lock().0) {
+                        return false;
+                    }
+                }
+                Statement::NumericFor(f) => {
+                    if !all_returns_one(&f.block.lock().0) {
+                        return false;
+                    }
+                }
+                Statement::GenericFor(f) => {
+                    if !all_returns_one(&f.block.lock().0) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+    fn always_returns_or_errors(stmts: &[Statement]) -> bool {
+        let Some(last) = stmts
+            .iter()
+            .rev()
+            .find(|s| !matches!(s, Statement::Empty(_) | Statement::Comment(_)))
+        else {
+            return false;
+        };
+        match last {
+            Statement::Return(_) => true,
+            Statement::Call(call) => matches!(call.value.as_ref(), RValue::Global(g) if g.0.as_slice() == b"error"),
+            Statement::If(r#if) => {
+                always_returns_or_errors(&r#if.then_block.lock().0)
+                    && always_returns_or_errors(&r#if.else_block.lock().0)
+            }
+            _ => false,
+        }
+    }
+    all_returns_one(stmts) && always_returns_or_errors(stmts)
+}
+
 /// Luau's builtins (`LuauBuiltinFunction`) returning one value
 /// (`getBuiltinInfo(id).results == 1`): every id up to `bit32.byteswap`'s
 /// but none, `assert`, `math.frexp`/`modf`, `string.byte`, `table.insert`/
@@ -58,28 +221,40 @@ fn one_result_builtin(id: u8) -> bool {
 }
 
 /// The parameter count of every non-variadic local function whose binder
-/// is written only by its declaration, and those of them each path of
-/// which returns exactly one value.
-fn local_functions(stmts: &[Statement], writes: &FxHashMap<RcLocal, usize>, out: &mut FxHashMap<RcLocal, usize>,
-    one_valued: &mut FxHashSet<RcLocal>) {
+/// is written only by its declaration (or bare forward declaration + closure),
+/// and those of them each non-diverging path of which returns exactly one value.
+fn local_functions(
+    stmts: &[Statement],
+    writes: &FxHashMap<RcLocal, usize>,
+    forward_nil_decls: &FxHashSet<RcLocal>,
+    error_trusted: bool,
+    out: &mut FxHashMap<RcLocal, usize>,
+    one_valued: &mut FxHashSet<RcLocal>,
+) {
     for statement in stmts {
         if let Statement::Assign(assign) = statement
-            && assign.prefix
             && let [LValue::Local(local)] = assign.left.as_slice()
             && let [RValue::Closure(closure)] = assign.right.as_slice()
-            && writes.get(local) == Some(&1)
+            && ((assign.prefix && writes.get(local) == Some(&1))
+                || (!assign.prefix
+                    && writes.get(local) == Some(&2)
+                    && forward_nil_decls.contains(local)))
         {
             let function = closure.function.0.lock();
             if !function.is_variadic {
                 out.insert(local.clone(), function.parameters.len());
             }
-            if crate::deinline::returns_exactly_one(&function.body.0) {
+            if returns_exactly_one_with_error(&function.body.0, error_trusted) {
                 one_valued.insert(local.clone());
             }
         }
-        for_each_block(statement, &mut |nested| local_functions(nested, writes, out, one_valued));
+        for_each_block(statement, &mut |nested| {
+            local_functions(nested, writes, forward_nil_decls, error_trusted, out, one_valued)
+        });
         crate::deinline::visit_stmt_rvalues(statement, &mut |value| {
-            closures(value, &mut |body| local_functions(&body.0, writes, out, one_valued));
+            closures(value, &mut |body| {
+                local_functions(&body.0, writes, forward_nil_decls, error_trusted, out, one_valued)
+            });
             true
         });
     }
@@ -349,5 +524,20 @@ mod tests {
         ]);
         assert!(output.contains("emit(`id {x}`)"), "{output}");
         assert!(output.contains("print((\"id %*\"):format(x))"), "{output}");
+    }
+
+    #[test]
+    fn shadowed_error_parameter_blocks_diverging_error_assumption() {
+        let err_param = local("error");
+        let mut inner = Function::default();
+        inner.parameters = vec![err_param.clone()];
+        inner.body = Block(vec![Call::new(RValue::Local(err_param), vec![Literal::String(b"x".to_vec()).into()]).into()]);
+        let closure = RValue::Closure(Closure {
+            node_origin: Default::default(),
+            function: ByAddress(Arc::new(Mutex::new(inner))),
+            upvalues: vec![],
+        });
+        let stmts = vec![Assign::new(vec![LValue::Local(local("f"))], vec![closure]).into()];
+        assert!(super::local_or_global_shadows_error(&stmts));
     }
 }

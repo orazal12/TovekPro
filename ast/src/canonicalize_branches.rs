@@ -474,26 +474,34 @@ fn contains_goto_or_label(block: &Block) -> bool {
 fn chain_adjacent_return_ifs(statements: &mut Vec<Statement>) {
     let mut index = 0;
     while index + 1 < statements.len() {
-        let Some((scrutinee, first_constant)) = return_arm_discriminator(&statements[index]) else {
+        let Some((scrutinee, mut constants)) = return_chain_discriminators(&statements[index]) else {
             index += 1;
             continue;
         };
-        let mut constants = vec![first_constant];
         let mut end = index + 1;
         while end < statements.len() {
-            let Some((next_scrutinee, next_constant)) = return_arm_discriminator(&statements[end])
-            else {
-                break;
-            };
-            if !rvalue_exact_eq(&scrutinee, &next_scrutinee)
-                || constants
+            if let Some((next_scrutinee, next_constants)) =
+                return_chain_discriminators(&statements[end])
+                && rvalue_exact_eq(&scrutinee, &next_scrutinee)
+                && next_constants
+                    .iter()
+                    .all(|next_c| !constants.iter().any(|c| rvalue_exact_eq(c, next_c)))
+            {
+                constants.extend(next_constants);
+                end += 1;
+            } else if let Some((next_scrutinee, next_constant)) =
+                equal_arm_discriminator(&statements[end])
+                && rvalue_exact_eq(&scrutinee, &next_scrutinee)
+                && !constants
                     .iter()
                     .any(|constant| rvalue_exact_eq(constant, &next_constant))
             {
+                constants.push(next_constant);
+                end += 1;
+                break;
+            } else {
                 break;
             }
-            constants.push(next_constant);
-            end += 1;
         }
 
         if end == index + 1 {
@@ -504,10 +512,7 @@ fn chain_adjacent_return_ifs(statements: &mut Vec<Statement>) {
         let mut run: Vec<_> = statements.drain(index..end).collect();
         let mut chain = run.pop().unwrap();
         while let Some(mut previous) = run.pop() {
-            let Statement::If(previous_if) = &mut previous else {
-                unreachable!()
-            };
-            previous_if.else_block.lock().0.push(chain);
+            attach_to_empty_else_tail(&mut previous, chain);
             chain = previous;
         }
         statements.insert(index, chain);
@@ -515,23 +520,62 @@ fn chain_adjacent_return_ifs(statements: &mut Vec<Statement>) {
     }
 }
 
-fn return_arm_discriminator(statement: &Statement) -> Option<(RValue, RValue)> {
+fn attach_to_empty_else_tail(head: &mut Statement, tail: Statement) {
+    let Statement::If(node) = head else {
+        unreachable!()
+    };
+    let mut else_block = node.else_block.lock();
+    if else_block.0.is_empty() {
+        else_block.0.push(tail);
+    } else {
+        attach_to_empty_else_tail(&mut else_block.0[0], tail);
+    }
+}
+
+fn return_chain_discriminators(statement: &Statement) -> Option<(RValue, Vec<RValue>)> {
     let Statement::If(node) = statement else {
         return None;
     };
-    if !node.else_block.lock().0.is_empty()
-        || !ends_in_return(&node.then_block.lock())
-        || contains_goto_or_label(&node.then_block.lock())
-    {
+    let (scrutinee, constant) = equal_condition_discriminator(&node.condition)?;
+    if !ends_in_return(&node.then_block.lock()) || contains_goto_or_label(&node.then_block.lock()) {
         return None;
     }
-    let RValue::Binary(condition) = &node.condition else {
+    let else_block = node.else_block.lock();
+    if else_block.0.is_empty() {
+        return Some((scrutinee, vec![constant]));
+    }
+    if let [nested @ Statement::If(_)] = else_block.0.as_slice() {
+        let (nested_scrutinee, mut nested_constants) = return_chain_discriminators(nested)?;
+        if rvalue_exact_eq(&scrutinee, &nested_scrutinee)
+            && !nested_constants
+                .iter()
+                .any(|c| rvalue_exact_eq(c, &constant))
+        {
+            let mut all = vec![constant];
+            all.append(&mut nested_constants);
+            return Some((scrutinee, all));
+        }
+    }
+    None
+}
+
+fn equal_arm_discriminator(statement: &Statement) -> Option<(RValue, RValue)> {
+    let Statement::If(node) = statement else {
+        return None;
+    };
+    if !node.else_block.lock().0.is_empty() || contains_goto_or_label(&node.then_block.lock()) {
+        return None;
+    }
+    equal_condition_discriminator(&node.condition)
+}
+
+fn equal_condition_discriminator(condition: &RValue) -> Option<(RValue, RValue)> {
+    let RValue::Binary(condition) = condition else {
         return None;
     };
     if condition.operation != BinaryOperation::Equal {
         return None;
     }
-
     let (scrutinee, constant) = match (&*condition.left, &*condition.right) {
         (RValue::Literal(_), right) if !matches!(right, RValue::Literal(_)) => {
             (right, &*condition.left)

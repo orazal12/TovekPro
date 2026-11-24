@@ -135,14 +135,342 @@ struct ScriptScan {
     /// i.e. a plain `Call` whose callee is `Index{ .., String(method) }`) — used
     /// to suppress signal `d`.
     static_dot_call_methods: FxHashSet<String>,
+    /// Per-prefix static dot-calls: `method -> Vec<prefix>`, so calling
+    /// `OtherModule.SetFoo(x)` does not poison `Class.SetFoo(self, x)` in the
+    /// class-consistency sweep.
+    static_dot_calls_by_prefix: FxHashMap<String, Vec<RValue>>,
+}
+
+impl ScriptScan {
+    fn is_static_dot_called_on(&self, prefix: &RValue, method: &str) -> bool {
+        self.static_dot_calls_by_prefix
+            .get(method)
+            .is_some_and(|prefixes| prefixes.iter().any(|p| p == prefix))
+    }
 }
 
 /// Entry point. Pre-scan the whole tree for module-level facts, then walk it
-/// again converting each genuine method definition in place.
+/// again converting each genuine method definition in place, followed by a
+/// class-consistency sweep for pure getters and unused-`self` methods on
+/// prefixes that already have confirmed colon methods.
 pub fn recover_methods(block: &mut Block) {
     let mut scan = ScriptScan::default();
     scan_block(block, &mut scan);
     convert_block(block, &scan);
+    let mut classes = ConfirmedClasses::default();
+    collect_confirmed_classes(block, &mut classes);
+    if !classes.fields_by_prefix.is_empty() {
+        convert_class_consistent_block(block, &scan, &classes);
+    }
+}
+
+#[derive(Default)]
+struct ConfirmedClasses {
+    /// For each `Prefix` that already has at least one confirmed `self` method:
+    /// the set of string field keys written on `self` in those methods.
+    fields_by_prefix: Vec<(RValue, FxHashSet<String>)>,
+}
+
+impl ConfirmedClasses {
+    fn entry_mut(&mut self, prefix: &RValue) -> &mut FxHashSet<String> {
+        if let Some(pos) = self.fields_by_prefix.iter().position(|(p, _)| p == prefix) {
+            return &mut self.fields_by_prefix[pos].1;
+        }
+        self.fields_by_prefix.push((prefix.clone(), FxHashSet::default()));
+        &mut self.fields_by_prefix.last_mut().unwrap().1
+    }
+
+    fn fields_of(&self, prefix: &RValue) -> Option<&FxHashSet<String>> {
+        self.fields_by_prefix
+            .iter()
+            .find(|(p, _)| p == prefix)
+            .map(|(_, fields)| fields)
+    }
+
+    fn fields_of_mut(&mut self, prefix: &RValue) -> Option<&mut FxHashSet<String>> {
+        self.fields_by_prefix
+            .iter_mut()
+            .find(|(p, _)| p == prefix)
+            .map(|(_, fields)| fields)
+    }
+}
+
+fn collect_confirmed_classes(block: &Block, out: &mut ConfirmedClasses) {
+    for statement in block.iter() {
+        if let Statement::Assign(assign) = statement
+            && assign.left.len() == 1
+            && assign.right.len() == 1
+            && let Some((prefix, _)) = method_target(&assign.left[0])
+            && let RValue::Closure(closure) = &assign.right[0]
+        {
+            let function = closure.function.lock();
+            if let Some(p0) = function.parameters.first()
+                && p0.0 .0.lock().0.as_deref() == Some("self")
+            {
+                let p0_key = local_ptr(p0);
+                let fields = out.entry_mut(prefix);
+                collect_self_written_fields(&function.body, p0_key, fields);
+            }
+        }
+        // Also harvest fields initialized in `setmetatable({ field = ... }, Class)`
+        // constructors so pure getters on read-only constructor fields qualify.
+        statement.visit_rvalues(&mut |value| {
+            collect_constructor_table_fields(value, out);
+            true
+        });
+        let mut nested = Vec::new();
+        collect_closures_in_statement_ref(statement, &mut nested);
+        for function in nested {
+            collect_confirmed_classes(&function.lock().body, out);
+        }
+        for_each_child_block(statement, |child| collect_confirmed_classes(child, out));
+    }
+}
+
+fn collect_constructor_table_fields(value: &RValue, out: &mut ConfirmedClasses) {
+    if let RValue::Call(call) | RValue::Select(Select::Call(call)) = value
+        && let RValue::Global(global) = call.value.as_ref()
+        && global.0.as_slice() == b"setmetatable"
+        && let [RValue::Table(table), meta] = call.arguments.as_slice()
+        && let Some(fields) = out.fields_of_mut(meta)
+    {
+        for (key, _) in &table.0 {
+            if let Some(RValue::Literal(Literal::String(key))) = key
+                && let Ok(key) = std::str::from_utf8(key)
+            {
+                fields.insert(key.to_string());
+            }
+        }
+    }
+    value.visit_rvalues(&mut |child| {
+        collect_constructor_table_fields(child, out);
+        true
+    });
+}
+
+fn collect_closures_in_statement_ref(
+    statement: &Statement,
+    out: &mut Vec<by_address::ByAddress<triomphe::Arc<parking_lot::Mutex<crate::Function>>>>,
+) {
+    fn walk(
+        value: &RValue,
+        out: &mut Vec<by_address::ByAddress<triomphe::Arc<parking_lot::Mutex<crate::Function>>>>,
+    ) {
+        if let RValue::Closure(closure) = value {
+            out.push(closure.function.clone());
+        }
+        value.visit_rvalues(&mut |child| {
+            walk(child, out);
+            true
+        });
+    }
+    statement.visit_rvalues(&mut |value| {
+        walk(value, out);
+        true
+    });
+}
+
+fn collect_self_written_fields(block: &Block, p0_key: usize, fields: &mut FxHashSet<String>) {
+    for statement in block.iter() {
+        if let Statement::Assign(assign) = statement {
+            for lvalue in &assign.left {
+                if let LValue::Index(index) = lvalue
+                    && rvalue_is_local(&index.left, p0_key)
+                    && let RValue::Literal(Literal::String(key)) = index.right.as_ref()
+                    && let Ok(key) = std::str::from_utf8(key)
+                {
+                    fields.insert(key.to_string());
+                }
+            }
+        }
+        let mut nested = Vec::new();
+        collect_closures_in_statement_ref(statement, &mut nested);
+        for function in nested {
+            collect_self_written_fields(&function.lock().body, p0_key, fields);
+        }
+        for_each_child_block(statement, |child| collect_self_written_fields(child, p0_key, fields));
+    }
+}
+
+fn convert_class_consistent_block(block: &mut Block, scan: &ScriptScan, classes: &ConfirmedClasses) {
+    for statement in &mut block.0 {
+        if let Statement::Assign(assign) = statement
+            && assign.left.len() == 1
+            && assign.right.len() == 1
+            && let Some((prefix, method)) = method_target(&assign.left[0])
+                .map(|(p, m)| (p.clone(), m.to_string()))
+            && let RValue::Closure(closure) = &assign.right[0]
+            && let Some(known_fields) = classes.fields_of(&prefix)
+        {
+            try_convert_class_member(&prefix, &method, closure, scan, known_fields);
+        }
+        let mut nested = Vec::new();
+        collect_nested_functions_in_statement(statement, &mut nested);
+        for function in nested {
+            convert_class_consistent_block(&mut function.lock().body, scan, classes);
+        }
+        for_each_child_block_mut(statement, |child| {
+            convert_class_consistent_block(child, scan, classes)
+        });
+    }
+}
+
+fn is_prototype_prefix(prefix: &RValue) -> bool {
+    matches!(
+        prefix,
+        RValue::Index(index)
+            if matches!(index.right.as_ref(), RValue::Literal(Literal::String(key)) if key.as_slice() == b"prototype")
+    )
+}
+
+fn try_convert_class_member(
+    prefix: &RValue,
+    method: &str,
+    closure: &crate::Closure,
+    scan: &ScriptScan,
+    known_fields: &FxHashSet<String>,
+) {
+    if scan.is_static_dot_called_on(prefix, method)
+        || matches!(method, "new" | "New" | "create" | "Create" | "from" | "From" | "is" | "Is")
+    {
+        return;
+    }
+    let function = closure.function.lock();
+    let Some(p0) = function.parameters.first() else {
+        return;
+    };
+    if p0.0.lock().source_name().is_some_and(|name| name != "self") {
+        return;
+    }
+    if p0.0 .0.lock().0.as_deref() == Some("self") {
+        return;
+    }
+    let p0_key = local_ptr(p0);
+    if function
+        .parameters
+        .iter()
+        .skip(1)
+        .any(|param| param.0 .0.lock().0.as_deref() == Some("self"))
+    {
+        return;
+    }
+    if block_mentions_self_name(&function.body) || block_writes_local(&function.body, p0_key) {
+        return;
+    }
+    let p0_untyped = function.parameter_annotations.first().is_none_or(Option::is_none)
+        && function.parameter_name_hints.first().is_none_or(Option::is_none);
+    let reads_known_field = block_reads_known_field(&function.body, p0_key, known_fields);
+    let unused_receiver =
+        p0_untyped && p0.0.lock().source_name().is_none() && !block_reads_local(&function.body, p0_key);
+    let prototype_member = p0_untyped && is_prototype_prefix(prefix);
+    if reads_known_field || unused_receiver || prototype_member {
+        p0.0 .0.lock().0 = Some("self".into());
+    }
+}
+
+fn block_reads_known_field(block: &Block, p0_key: usize, known_fields: &FxHashSet<String>) -> bool {
+    if known_fields.is_empty() {
+        return false;
+    }
+    fn rvalue_reads_field(value: &RValue, p0_key: usize, known_fields: &FxHashSet<String>) -> bool {
+        if let RValue::Index(index) = value
+            && rvalue_is_local(&index.left, p0_key)
+            && let RValue::Literal(Literal::String(key)) = index.right.as_ref()
+            && std::str::from_utf8(key).is_ok_and(|k| known_fields.contains(k))
+        {
+            return true;
+        }
+        if let RValue::Closure(closure) = value
+            && block_reads_known_field(&closure.function.lock().body, p0_key, known_fields)
+        {
+            return true;
+        }
+        let mut found = false;
+        value.visit_rvalues(&mut |child| {
+            if rvalue_reads_field(child, p0_key, known_fields) {
+                found = true;
+                false
+            } else {
+                true
+            }
+        });
+        found
+    }
+    for statement in block.iter() {
+        let mut found = false;
+        statement.visit_rvalues(&mut |rvalue| {
+            if rvalue_reads_field(rvalue, p0_key, known_fields) {
+                found = true;
+                false
+            } else {
+                true
+            }
+        });
+        if found {
+            return true;
+        }
+        let mut child_found = false;
+        for_each_child_block(statement, |child| {
+            child_found = child_found || block_reads_known_field(child, p0_key, known_fields);
+        });
+        if child_found {
+            return true;
+        }
+    }
+    false
+}
+
+fn block_reads_local(block: &Block, key: usize) -> bool {
+    fn rvalue_reads(value: &RValue, key: usize) -> bool {
+        if rvalue_is_local(value, key) {
+            return true;
+        }
+        if let RValue::Closure(closure) = value {
+            if closure.upvalues.iter().any(|u| match u {
+                crate::Upvalue::Copy(l) | crate::Upvalue::Ref(l) => local_ptr(l) == key,
+            }) {
+                return true;
+            }
+            if block_reads_local(&closure.function.lock().body, key) {
+                return true;
+            }
+        }
+        let mut found = false;
+        value.visit_rvalues(&mut |child| {
+            if rvalue_reads(child, key) {
+                found = true;
+                false
+            } else {
+                true
+            }
+        });
+        found
+    }
+    for statement in block.iter() {
+        if !statement.visit_local_reads(&mut |r| local_ptr(r) != key) {
+            return true;
+        }
+        let mut found = false;
+        statement.visit_rvalues(&mut |rvalue| {
+            if rvalue_reads(rvalue, key) {
+                found = true;
+                false
+            } else {
+                true
+            }
+        });
+        if found {
+            return true;
+        }
+        let mut child_found = false;
+        for_each_child_block(statement, |child| {
+            child_found = child_found || block_reads_local(child, key);
+        });
+        if child_found {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -222,8 +550,12 @@ fn note_static_dot_call(call: &crate::Call, scan: &mut ScriptScan) {
     if let RValue::Index(index) = call.value.as_ref() {
         if let RValue::Literal(Literal::String(method)) = index.right.as_ref() {
             if is_valid_name(method) {
-                scan.static_dot_call_methods
-                    .insert(String::from_utf8_lossy(method).into_owned());
+                let name = String::from_utf8_lossy(method).into_owned();
+                scan.static_dot_call_methods.insert(name.clone());
+                let bucket = scan.static_dot_calls_by_prefix.entry(name).or_default();
+                if !bucket.contains(&index.left) {
+                    bucket.push((*index.left).clone());
+                }
             }
         }
     }
@@ -1134,5 +1466,46 @@ mod tests {
         };
         let inner_body = &outer.function.lock().body;
         assert_eq!(first_param_name(inner_body, 0).as_deref(), Some("self"));
+    }
+
+    #[test]
+    fn other_prefix_dot_call_does_not_block_class_method_recovery() {
+        let cls = global("Controller");
+        let other = global("Display");
+        let p_init = local("p");
+        let p_get = local("p2");
+        let mut block = Block(vec![
+            // Confirmed colon method on Controller writing `self.enabled`.
+            method_assignment(
+                cls.clone(),
+                "SetEnabled",
+                vec![p_init.clone()],
+                Block(vec![Assign::new(
+                    vec![LValue::Index(Index::new(local_value(&p_init), string("enabled")))],
+                    vec![number(1.0)],
+                )
+                .into()]),
+            ),
+            // Unrelated static dot call `Display.GetEnabled()` must not poison `Controller.GetEnabled`.
+            crate::Call::new(
+                RValue::Index(Index::new(other, string("GetEnabled"))),
+                vec![],
+            )
+            .into(),
+            // Pure getter on Controller reading known field `enabled`.
+            method_assignment(
+                cls,
+                "GetEnabled",
+                vec![p_get.clone()],
+                Block(vec![crate::Return::new(vec![RValue::Index(Index::new(
+                    local_value(&p_get),
+                    string("enabled"),
+                ))])
+                .into()]),
+            ),
+        ]);
+        recover_methods(&mut block);
+        assert_eq!(first_param_name(&block, 0).as_deref(), Some("self"));
+        assert_eq!(first_param_name(&block, 2).as_deref(), Some("self"));
     }
 }

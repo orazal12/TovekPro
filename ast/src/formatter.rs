@@ -707,7 +707,7 @@ mod tests {
                 indentation_level: 0, indentation_mode: IndentationMode::Tab,
                 output: &mut output, colon_method_calls: Default::default(),
                 position_query: None, closure_observer: None, emission_map: None,
-                layout_budget: None, compact_annotations: false, inferred_calls: Default::default(),
+                layout_budget: None, compact_annotations: false, clean_comments: false, inferred_calls: Default::default(),
             };
             FORMAT_WORK.set(FormatWork::default());
             assert!(formatter.try_format_interpolation(bytes, &arguments).is_none());
@@ -1501,7 +1501,7 @@ end");
         let mut formatter = super::Formatter { indentation_level: 0, indentation_mode: IndentationMode::Tab,
             output: &mut output, colon_method_calls: Default::default(), position_query: None, closure_observer: None,
             emission_map: Some(&mut exhausted), layout_budget: None, compact_annotations: true,
-            inferred_calls: Default::default() };
+            clean_comments: false, inferred_calls: Default::default() };
         formatter.format_comment(&crate::Comment::new(known.into())).unwrap();
         assert!(output.contains(known));
     }
@@ -1707,6 +1707,7 @@ pub(crate) fn format_arg_list(list: &[RValue]) -> String {
         emission_map: None,
         layout_budget: None,
         compact_annotations: false,
+        clean_comments: false,
         inferred_calls: Default::default(),
     }
     .format_arg_list(list, Arguments::Flat);
@@ -1777,6 +1778,10 @@ pub struct Formatter<'a, W: fmt::Write> {
     /// uses None; previews never recursively ask for another width preview.
     pub(crate) layout_budget: Option<usize>,
     pub(crate) compact_annotations: bool,
+    /// When true (`--clean-comments` / `--pro`), omit decompiler diagnostic
+    /// comments (`-- inferred equivalent call`, `-- parallel`, `[DEDUP]`, etc.)
+    /// while preserving `--!native` hot comments and compile-error messages.
+    pub(crate) clean_comments: bool,
     /// Inferred calls per helper, for the definition lines; empty in previews.
     pub(crate) inferred_calls: InferredCalls,
 }
@@ -1926,6 +1931,16 @@ pub fn format_with_emission_map_options(
     detailed: bool,
     compact_annotations: bool,
 ) -> Result<(String, Vec<ClosureSourceOccurrence>, crate::emission_map::EmissionMap), fmt::Error> {
+    format_with_emission_map_full(main, indentation_mode, detailed, compact_annotations, false)
+}
+
+pub fn format_with_emission_map_full(
+    main: &Block,
+    indentation_mode: IndentationMode,
+    detailed: bool,
+    compact_annotations: bool,
+    clean_comments: bool,
+) -> Result<(String, Vec<ClosureSourceOccurrence>, crate::emission_map::EmissionMap), fmt::Error> {
     let mut output = String::new();
     let mut tracked = PositionTrackingWriter::new(&mut output);
     let mut occurrences = Vec::new();
@@ -1942,13 +1957,38 @@ pub fn format_with_emission_map_options(
             emission_map: detailed.then_some(&mut emission_map),
             layout_budget: None,
             compact_annotations,
-            inferred_calls: InferredCalls::count(main),
+            clean_comments,
+            inferred_calls: if clean_comments {
+                InferredCalls::default()
+            } else {
+                InferredCalls::count(main)
+            },
         };
         formatter.format_block_no_indent(main)?;
     }
     occurrences.sort_by_key(|occurrence| occurrence.span.start.byte_offset);
     emission_map.sort();
     Ok((output, occurrences, emission_map))
+}
+
+pub fn format_clean(main: &Block, indentation_mode: IndentationMode) -> Result<String, fmt::Error> {
+    let mut output = String::new();
+    let mut tracked = PositionTrackingWriter::new(&mut output);
+    let mut formatter = Formatter {
+        indentation_level: 0,
+        indentation_mode,
+        output: &mut tracked,
+        colon_method_calls: collect_colon_method_calls(main),
+        position_query: Some(tracked_position::<String>),
+        closure_observer: None,
+        emission_map: None,
+        layout_budget: None,
+        compact_annotations: false,
+        clean_comments: true,
+        inferred_calls: InferredCalls::default(),
+    };
+    formatter.format_block_no_indent(main)?;
+    Ok(output)
 }
 
 fn collect_colon_method_calls(block: &Block) -> ColonMethodCalls {
@@ -2035,6 +2075,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             emission_map: None,
             layout_budget: None,
             compact_annotations: false,
+            clean_comments: false,
             inferred_calls: InferredCalls::count(main),
         };
         formatter.format_block_no_indent(main)
@@ -2149,17 +2190,25 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         let mut defined = None;
         // Adjacent boundaries share one immutable statement's line census.
         let mut cached_lines = None;
+        let mut wrote_any = false;
         for (i, statement) in block.iter().enumerate() {
             if defined == Some(i) {
                 continue;
             }
+            if self.clean_comments
+                && let Statement::Comment(comment) = statement
+                && !comment.hot
+                && crate::annotations::compact_text(&comment.text).is_some()
+            {
+                continue;
+            }
             // A trailing comment is appended to the PRECEDING statement's line
-            // (` -- text`): no leading newline, no indentation. Guarded on `i != 0`
+            // (` -- text`): no leading newline, no indentation. Guarded on `wrote_any`
             // so a comment with nothing before it falls back to its own line. The
             // preceding statement already wrote its separating `;` (a line comment
             // is not a statement separator in Lua), so `f(); -- text` stays
             // correctly separated.
-            if i != 0
+            if wrote_any
                 && let Statement::Comment(comment) = statement
                 && comment.trailing
             {
@@ -2167,12 +2216,13 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                 self.format_comment(comment)?;
                 continue;
             }
-            if i != 0 {
+            if wrote_any {
                 writeln!(self.output)?;
                 if Self::wants_blank_line(block, i, &mut cached_lines) {
                     writeln!(self.output)?;
                 }
             }
+            wrote_any = true;
             // `local f` then `f = function ... end` is what `local function f`
             // is defined as.
             let definition = Self::local_function_definition(block, i);
@@ -3318,6 +3368,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             emission_map: None,
             layout_budget: self.layout_budget,
             compact_annotations: self.compact_annotations,
+            clean_comments: self.clean_comments,
             inferred_calls: self.inferred_calls.detached(),
         };
         sub.format_rvalue(rvalue).ok()?;
@@ -3654,7 +3705,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             }
         }
 
-        if assign.parallel {
+        if assign.parallel && !self.clean_comments {
             write!(self.output, " -- parallel")?;
         }
 

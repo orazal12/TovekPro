@@ -1,7 +1,7 @@
 --!nocheck
 -- decompile-batch.client.luau
 --
--- Executor-side client for the Tovek decompiler server's BATCH + RAW features.
+-- Executor-side client for the TovekPro decompiler server's BATCH + RAW features.
 --
 -- The simple client (decompile.client.luau) base64-encodes each script and POSTs
 -- them one-at-a-time as SynSaveInstance walks the game — hundreds of round-trips,
@@ -27,6 +27,7 @@ local SINGLE_URL = BASE_URL .. "/decompile"
 local KEY = 203 -- Roblox client bytecode decode key.
 local CHUNK_SIZE = 250 -- scripts per HTTP request (bounds body size + memory).
 local USE_RAW = true -- false → base64-in-JSON batch (safe if raw bodies get mangled).
+local USE_PRO_MODE = true -- sends `X-Decompile-Flags: PRO` (compact style, stdlib constants, clean comments).
 
 -- Resolve the executor's HTTP request function (names differ per executor).
 local httpRequest = request or http_request or (syn and syn.request) or (http and http.request)
@@ -128,7 +129,10 @@ local function sendChunk(chunk, cache)
     local response = post({
         Url = BATCH_URL,
         Method = "POST",
-        Headers = { ["Content-Type"] = contentType },
+        Headers = {
+            ["Content-Type"] = contentType,
+            ["X-Decompile-Flags"] = USE_PRO_MODE and "PRO" or "NONE",
+        },
         Body = body,
     })
 
@@ -177,6 +181,7 @@ local function singleDecompile(inst)
             Headers = {
                 ["Content-Type"] = "application/octet-stream",
                 ["X-Script-Name"] = inst:GetFullName(),
+                ["X-Decompile-Flags"] = USE_PRO_MODE and "PRO" or "NONE",
             },
             Body = bc,
         })
@@ -184,7 +189,10 @@ local function singleDecompile(inst)
         response = post({
             Url = SINGLE_URL,
             Method = "POST",
-            Headers = { ["X-Script-Name"] = inst:GetFullName() },
+            Headers = {
+                ["X-Script-Name"] = inst:GetFullName(),
+                ["X-Decompile-Flags"] = USE_PRO_MODE and "PRO" or "NONE",
+            },
             Body = crypt.base64.encode(bc),
         })
     end

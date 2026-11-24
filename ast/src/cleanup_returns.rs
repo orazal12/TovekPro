@@ -173,7 +173,35 @@ fn merge_tail_guards(block: &mut Block) {
 }
 
 fn strip_if_arms(r#if: &crate::If) {
-    strip_tail(&mut r#if.then_block.lock(), false);
+    let keep_guard_return = {
+        let then_block = r#if.then_block.lock();
+        let else_block = r#if.else_block.lock();
+        let then_real = then_block
+            .0
+            .iter()
+            .filter(|s| !matches!(s, Statement::Empty(_)))
+            .count();
+        let else_real: Vec<_> = else_block
+            .0
+            .iter()
+            .filter(|s| !matches!(s, Statement::Empty(_)))
+            .collect();
+        let is_elseif = matches!(else_real.as_slice(), [Statement::If(_)]);
+        let then_ends_void_return = then_block
+            .0
+            .iter()
+            .rev()
+            .find(|s| !matches!(s, Statement::Empty(_)))
+            .is_some_and(|s| matches!(s, Statement::Return(r) if r.values.is_empty()));
+        // Keep the guard's early `return` when `then` is a tiny guard (<= 2
+        // statements including `return`) and `else` is a large non-`elseif`
+        // body (>= 4 statements), so `cleanup_control_flow` can lift `else`
+        // out instead of trapping the entire main path inside `else`.
+        then_ends_void_return && then_real <= 2 && !is_elseif && else_real.len() >= 4
+    };
+    if !keep_guard_return {
+        strip_tail(&mut r#if.then_block.lock(), false);
+    }
     strip_tail(&mut r#if.else_block.lock(), true);
 }
 

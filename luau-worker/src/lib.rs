@@ -205,6 +205,11 @@ fn parse_flags_text(raw: &str) -> std::result::Result<DecompileOptions, String> 
         match normalized.as_str() {
             "NONE" => {}
             "DONT_REUSE_VAR" => options.dont_reuse_var = true,
+            "ASSUME_NO_NAN" => options.assume_no_nan = true,
+            "COMPACT_STYLE" => options.compact_style = true,
+            "ASSUME_STANDARD_LIBRARIES" => options.assume_standard_libraries = true,
+            "CLEAN_COMMENTS" => options.clean_comments = true,
+            "PRO" => options = options.union(DecompileOptions::pro()),
             "STRICT_NO_SYNTHETIC_CONTROL" => {
                 options.control_flow_policy = ControlFlowOutputPolicy::StrictNoSyntheticControl;
             }

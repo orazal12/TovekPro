@@ -276,8 +276,7 @@ fn can_invert_guard_cleanly(condition: &RValue) -> bool {
         RValue::Unary(unary) if unary.operation == UnaryOperation::Not
     ) || matches!(
         condition,
-        RValue::Binary(binary)
-            if matches!(binary.operation, BinaryOperation::Equal | BinaryOperation::NotEqual)
+        RValue::Binary(binary) if binary.operation == BinaryOperation::NotEqual
     )
 }
 
@@ -1183,5 +1182,23 @@ mod tests {
         let inner_body = gf.block.lock();
         assert_eq!(inner_body.0.len(), 3, "inner for guards recovered");
         assert!(is_continue_guard(&inner_body.0[0]));
+    }
+
+    #[test]
+    fn positive_equality_guards_merge_with_or_not_double_negation() {
+        let status = local("status");
+        let a = local("a");
+        let b = local("b");
+        let ret = || Statement::Return(Return::new(vec![lv(&status)]));
+        let mut block = Block(vec![
+            if_then(eq(lv(&status), lv(&a)), vec![ret()]),
+            if_then(eq(lv(&status), lv(&b)), vec![ret()]),
+        ]);
+
+        recover_guard_continue(&mut block);
+
+        let rendered = block.to_string();
+        assert!(rendered.contains("if status == a or status == b then"), "{rendered}");
+        assert!(!rendered.contains("not ("), "{rendered}");
     }
 }

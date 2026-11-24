@@ -1,5 +1,5 @@
 #!/usr/bin/env pwsh
-# run-server.ps1 — build (if needed) and launch the Medal Luau decompiler web server.
+# run-server.ps1 — build (if needed) and launch the TovekPro Luau decompiler web server.
 #
 #   POST http://127.0.0.1:3000/decompile
 #     Body    : base64-encoded Luau bytecode
@@ -31,6 +31,6 @@ if ($Build -or -not (Test-Path $Exe)) {
     }
 }
 
-Write-Host "==> Starting decompiler server on http://127.0.0.1:3000/decompile" -ForegroundColor Green
+Write-Host "==> Starting TovekPro decompiler server on http://127.0.0.1:3000/decompile" -ForegroundColor Green
 Write-Host "    (Ctrl+C to stop)" -ForegroundColor DarkGray
 & $Exe

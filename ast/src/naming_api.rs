@@ -46,9 +46,24 @@ pub fn roblox_event_parameters(event: &str) -> Option<&'static [Option<&'static 
             &[Some("character")]
         }
         "PlayerAdded" | "PlayerRemoving" => &[Some("player")],
+        "Chatted" => &[Some("message")],
         "Triggered" => &[Some("player")],
         "PromptTriggered" => &[Some("prompt"), Some("player")],
         "Touched" | "TouchEnded" => &[Some("otherPart")],
+        "TouchTap" | "TouchTapInWorld" => &[Some("touchPositions"), Some("gameProcessed")],
+        "TouchLongPress" => &[Some("touchPositions"), Some("state"), Some("gameProcessed")],
+        "TouchMoved" => &[Some("touch"), Some("gameProcessed")],
+        "Blocked" => &[Some("waypointIndex")],
+        "MoveToFinished" => &[Some("reached")],
+        "FocusLost" => &[Some("enterPressed"), Some("inputObject")],
+        "HealthChanged" => &[Some("health")],
+        "StateChanged" => &[Some("oldState"), Some("newState")],
+        "AttributeChanged" => &[Some("attributeName")],
+        "Running" | "Climbing" | "Swimming" => &[Some("speed")],
+        "Jumping" | "Seated" | "FreeFalling" => &[Some("active")],
+        "Activated" => &[Some("inputObject"), Some("clickCount")],
+        "MouseEnter" | "MouseLeave" | "MouseMoved" | "MouseWheelForward"
+        | "MouseWheelBackward" => &[Some("x"), Some("y")],
         _ => return None,
     })
 }

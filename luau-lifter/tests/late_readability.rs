@@ -624,7 +624,7 @@ fn copies_line_info_counts_on_one_line_are_calls() {
     let source = decompile(SAME_LINE_COPIES);
     for line in ["v.new(randomRange(-0.08, 0.08), randomRange(0, 0.08), randomRange(-0.08, 0.08)) -- inferred equivalent call\n",
         "\tlocal v4 = randomRange(0, 6.283185307179586) -- inferred equivalent call\n",
-        "\treturn randomVector(data, data2), randomRange(0.5, 1.5) -- inferred equivalent call\n"]
+        "\treturn randomVector(vector, vector2), randomRange(0.5, 1.5) -- inferred equivalent call\n"]
     {
         assert!(source.contains(line), "{line}\n{source}");
     }

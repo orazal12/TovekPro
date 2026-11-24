@@ -68,6 +68,23 @@ pub(crate) fn block_size(stmts: &[Statement]) -> usize {
 //   otherwise    ->  not (cond)   (the formatter parenthesises by precedence)
 // Relational operators are deliberately NOT flipped: `not (a < b)` differs from
 // `a >= b` when an operand is NaN, so we keep an explicit `not`.
+/// Whether negating `cond` via De Morgan simplifies every leaf without adding
+/// new `not` operators (`not x`, `a == b`, `a ~= b`, recursively over `and`/`or`).
+/// Strictly NaN-safe because relational operators (`<`, `<=`, `>`, `>=`) are excluded.
+fn demorgan_simplifies_all(cond: &RValue) -> bool {
+    match cond {
+        RValue::Unary(u) if u.operation == UnaryOperation::Not => true,
+        RValue::Binary(b) => match b.operation {
+            BinaryOperation::Equal | BinaryOperation::NotEqual => true,
+            BinaryOperation::And | BinaryOperation::Or => {
+                demorgan_simplifies_all(&b.left) && demorgan_simplifies_all(&b.right)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 pub(crate) fn negate(cond: RValue) -> RValue {
     match cond {
         RValue::Unary(u) if u.operation == UnaryOperation::Not => *u.value,
@@ -85,6 +102,22 @@ pub(crate) fn negate(cond: RValue) -> RValue {
                 node_origin: Default::default(),
                 left: b.left,
                 right: b.right,
+                operation,
+            })
+        }
+        RValue::Binary(b)
+            if matches!(b.operation, BinaryOperation::And | BinaryOperation::Or)
+                && demorgan_simplifies_all(&b.left)
+                && demorgan_simplifies_all(&b.right) =>
+        {
+            let operation = match b.operation {
+                BinaryOperation::And => BinaryOperation::Or,
+                _ => BinaryOperation::And,
+            };
+            RValue::Binary(Binary {
+                node_origin: Default::default(),
+                left: Box::new(negate(*b.left)),
+                right: Box::new(negate(*b.right)),
                 operation,
             })
         }

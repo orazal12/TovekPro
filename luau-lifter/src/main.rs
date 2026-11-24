@@ -23,7 +23,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser, Debug)]
-#[command(about, version = "V2.7", author)]
+#[command(name = "TovekPro", about = "TovekPro — ultra-readable, high-performance Luau decompiler", version = "TovekPro V2.7", author)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -109,6 +109,14 @@ struct FolderArgs {
     /// Assumes no other script replaces the libraries in its environment.
     #[arg(long)]
     assume_standard_libraries: bool,
+    /// Omit decompiler diagnostic comments (`-- inferred equivalent call`,
+    /// `-- parallel`, `[DEDUP]`) while preserving `--!native` directives.
+    #[arg(long)]
+    clean_comments: bool,
+    /// TovekPro maximum-readability preset: enables `--style compact`,
+    /// `--assume-standard-libraries`, `--assume-no-nan`, and `--clean-comments`.
+    #[arg(long)]
+    pro: bool,
     /// Source extension written by the folder decompiler.
     #[arg(long, default_value = "luau", value_parser = ["lua", "luau"])]
     output_extension: String,
@@ -177,6 +185,16 @@ struct ValidateArgs {
     /// Output style: `default` or `compact` (see `decompile-folder --help`).
     #[arg(long, default_value = "default", value_parser = ["default", "compact"])]
     style: String,
+    /// Write folded constants as `math.pi`, `math.huge` and `Vector3.new(...)`.
+    #[arg(long)]
+    assume_standard_libraries: bool,
+    /// Omit decompiler diagnostic comments while preserving `--!native`.
+    #[arg(long)]
+    clean_comments: bool,
+    /// TovekPro maximum-readability preset (`--style compact`, `--assume-standard-libraries`,
+    /// `--assume-no-nan`, `--clean-comments`).
+    #[arg(long)]
+    pro: bool,
     /// luau-analyze typechecker: `new` (default, the validate_all.sh parity
     /// baseline) or `old` (~8x faster, opt-in fast path; diagnostics may differ
     /// on dirty corpora, so not for CI gating).
@@ -201,12 +219,13 @@ fn main() {
                 let options = luau_lifter::DecompileOptions {
                     dont_reuse_var: a.dont_reuse_var,
                     no_synth_helpers: a.no_synth_helpers,
-                    assume_no_nan: a.assume_no_nan,
+                    assume_no_nan: a.assume_no_nan || a.pro,
                     synthesize_arithmetic_loops: a.synthesize_arithmetic_loops,
                     emit_binding_provenance: a.emit_binding_provenance,
                     compact_annotations: a.compact_annotations,
-                    compact_style: a.style == "compact",
-                    assume_standard_libraries: a.assume_standard_libraries,
+                    compact_style: a.style == "compact" || a.pro,
+                    assume_standard_libraries: a.assume_standard_libraries || a.pro,
+                    clean_comments: a.clean_comments || a.pro,
                     control_flow_policy: folder_control_flow_policy(
                         a.strict_no_synthetic_control,
                         a.allow_certified_dispatcher,
@@ -250,9 +269,11 @@ fn main() {
                     luau_lifter::DecompileOptions {
                         dont_reuse_var: a.dont_reuse_var,
                         no_synth_helpers: a.no_synth_helpers,
-                        assume_no_nan: a.assume_no_nan,
-                    synthesize_arithmetic_loops: a.synthesize_arithmetic_loops,
-                        compact_style: a.style == "compact",
+                        assume_no_nan: a.assume_no_nan || a.pro,
+                        synthesize_arithmetic_loops: a.synthesize_arithmetic_loops,
+                        compact_style: a.style == "compact" || a.pro,
+                        assume_standard_libraries: a.assume_standard_libraries || a.pro,
+                        clean_comments: a.clean_comments || a.pro,
                         control_flow_policy: folder_control_flow_policy(
                             a.strict_no_synthetic_control,
                             a.allow_certified_dispatcher,
@@ -356,6 +377,23 @@ mod policy_tests {
         assert!(args.strict_no_synthetic_control);
         assert!(!args.allow_certified_dispatcher);
 
+        for command in ["decompile-folder", "validate-folder"] {
+            let parsed = Cli::try_parse_from([
+                "luau-lifter",
+                command,
+                "src",
+                "out",
+                "--pro",
+                "--clean-comments",
+            ])
+            .expect("--pro and --clean-comments are accepted");
+            let (pro, clean) = match parsed.command {
+                Command::DecompileFolder(a) => (a.pro, a.clean_comments),
+                Command::ValidateFolder(a) => (a.pro, a.clean_comments),
+            };
+            assert!(pro && clean);
+        }
+
         assert!(
             Cli::try_parse_from([
                 "luau-lifter",
@@ -373,9 +411,10 @@ mod policy_tests {
 /// The single-file mode's usage line (`luau-lifter --help` lists the folder
 /// subcommands).
 const SINGLE_FILE_USAGE: &str = "usage: luau-lifter <bytecode file> [-e] [--script-name NAME] \
-[--stats-json PATH] [--style default|compact] [--strict-no-synthetic-control] \
-[--allow-certified-dispatcher] [--dont-reuse-var] [--no-synth-helpers] [--assume-no-nan] \
-[--assume-standard-libraries] [--synthesize-arithmetic-loops]\n       luau-lifter --help";
+[--stats-json PATH] [--style default|compact] [--pro] [--clean-comments] \
+[--strict-no-synthetic-control] [--allow-certified-dispatcher] [--dont-reuse-var] \
+[--no-synth-helpers] [--assume-no-nan] [--assume-standard-libraries] \
+[--synthesize-arithmetic-loops]\n       luau-lifter --help";
 
 /// Report a bad invocation and exit 2. The process-wide quiet panic hook
 /// swallows panic messages, so an `expect` here exited 101 with nothing said.
@@ -404,6 +443,8 @@ fn run_single_file() {
             "--no-synth-helpers" => options.no_synth_helpers = true,
             "--assume-no-nan" => options.assume_no_nan = true,
             "--assume-standard-libraries" => options.assume_standard_libraries = true,
+            "--clean-comments" => options.clean_comments = true,
+            "--pro" => options = options.union(luau_lifter::DecompileOptions::pro()),
             "--synthesize-arithmetic-loops" => options.synthesize_arithmetic_loops = true,
             "--allow-certified-dispatcher" => {
                 options.control_flow_policy =

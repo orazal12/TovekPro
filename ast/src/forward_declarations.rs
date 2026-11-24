@@ -17,7 +17,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::{Block, LValue, Literal, LocalRw, RValue, RcLocal, Statement};
+use crate::{Block, LValue, Literal, LocalRw, RValue, RcLocal, Statement, Traverse};
 
 #[derive(Default)]
 struct Writes {
@@ -26,7 +26,8 @@ struct Writes {
     other: usize,
 }
 
-/// Rewrite `local f = nil` to `local f` for every forward-declared function.
+/// Rewrite `local f = nil` to `local f` for every forward-declared function,
+/// and for uncaptured branch-initialized declarations (`local x = nil; if c then x = a else x = b end`).
 pub fn bare_forward_declarations(block: &mut Block) {
     // Candidates are locals that a later statement assigns a closure (rare);
     // only their writes are counted.
@@ -43,13 +44,10 @@ pub fn bare_forward_declarations(block: &mut Block) {
             }
         }
     });
-    if writes.is_empty() {
-        return;
+    if !writes.is_empty() {
+        visit_statements(block, &mut |statement| census_statement(statement, &mut writes));
     }
-    visit_statements(block, &mut |statement| census_statement(statement, &mut writes));
-    if writes.values().any(is_forward_function) {
-        rewrite_block(block, &writes);
-    }
+    rewrite_block(block, &writes);
 }
 
 fn is_forward_function(writes: &Writes) -> bool {
@@ -95,17 +93,189 @@ fn census_statement(statement: &Statement, writes: &mut FxHashMap<RcLocal, Write
     }
 }
 
+fn block_writes_before_read(block: &Block, local: &RcLocal) -> bool {
+    for stmt in &block.0 {
+        match stmt {
+            Statement::Empty(_) | Statement::Comment(_) => continue,
+            Statement::Assign(assign) if assign.prefix => {
+                if assign.right.iter().any(|r| rvalue_reads_or_captures(r, local)) {
+                    return false;
+                }
+                continue;
+            }
+            Statement::Assign(assign) if !assign.prefix && !assign.compound => {
+                // Any read in RHS or index targets happens before the write.
+                if assign.right.iter().any(|r| rvalue_reads_or_captures(r, local)) {
+                    return false;
+                }
+                if assign.left.iter().any(|l| match l {
+                    LValue::Index(index) => index.any_local_read(&mut |read| read == local),
+                    _ => false,
+                }) {
+                    return false;
+                }
+                if assign.left.iter().any(|l| matches!(l, LValue::Local(t) if t == local)) {
+                    return true;
+                }
+                return false;
+            }
+            Statement::If(branch) => {
+                if rvalue_reads_or_captures(&branch.condition, local) {
+                    return false;
+                }
+                let then_block = branch.then_block.lock();
+                let else_block = branch.else_block.lock();
+                return !else_block.0.is_empty()
+                    && block_writes_before_read(&then_block, local)
+                    && block_writes_before_read(&else_block, local);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn rvalue_captures_local(value: &RValue, local: &RcLocal) -> bool {
+    let mut captured = false;
+    fn walk(value: &RValue, local: &RcLocal, captured: &mut bool) {
+        if *captured {
+            return;
+        }
+        if let RValue::Closure(closure) = value {
+            for upvalue in &closure.upvalues {
+                let (crate::Upvalue::Copy(up) | crate::Upvalue::Ref(up)) = upvalue;
+                if up == local {
+                    *captured = true;
+                    return;
+                }
+            }
+        }
+        value.visit_rvalues(&mut |child| {
+            walk(child, local, captured);
+            !*captured
+        });
+    }
+    walk(value, local, &mut captured);
+    captured
+}
+
+fn rvalue_reads_local_outside_closures(value: &RValue, local: &RcLocal) -> bool {
+    let mut found = false;
+    fn walk(value: &RValue, local: &RcLocal, found: &mut bool) {
+        if *found {
+            return;
+        }
+        match value {
+            RValue::Local(read) if read == local => {
+                *found = true;
+                return;
+            }
+            RValue::Closure(_) => return,
+            _ => {}
+        }
+        value.visit_rvalues(&mut |child| {
+            walk(child, local, found);
+            !*found
+        });
+    }
+    walk(value, local, &mut found);
+    found
+}
+
+fn rvalue_reads_or_captures(value: &RValue, local: &RcLocal) -> bool {
+    value.any_local_read(&mut |read| read == local) || rvalue_captures_local(value, local)
+}
+
+fn statement_touches_local(statement: &Statement, local: &RcLocal) -> bool {
+    let mut touched = false;
+    statement.visit_local_reads(&mut |read| {
+        if read == local {
+            touched = true;
+        }
+        !touched
+    });
+    if touched {
+        return true;
+    }
+    statement.visit_local_writes(&mut |written| {
+        if written == local {
+            touched = true;
+        }
+        !touched
+    });
+    if touched {
+        return true;
+    }
+    let mut captured = false;
+    statement.visit_rvalues(&mut |value| {
+        if rvalue_captures_local(value, local) {
+            captured = true;
+        }
+        !captured
+    });
+    captured
+}
+
 fn rewrite_block(block: &mut Block, writes: &FxHashMap<RcLocal, Writes>) {
-    for statement in &mut block.0 {
-        if let Statement::Assign(assign) = statement
+    for index in 0..block.0.len() {
+        let strip_nil = if let Statement::Assign(assign) = &block.0[index]
             && assign.prefix
             && assign.left.len() == 1
             && matches!(assign.right.as_slice(), [RValue::Literal(Literal::Nil)])
             && let LValue::Local(local) = &assign.left[0]
-            && writes.get(local).is_some_and(is_forward_function)
         {
+            if writes.get(local).is_some_and(is_forward_function) {
+                true
+            } else if writes.get(local).is_none() {
+                // Pattern A: `local conn = nil; conn = sig:Connect(function() conn:Disconnect() end)`
+                // Pattern B: `local x = nil; [unrelated stmts]; if cond then ... x = ... else ... x = ... end`
+                let mut found = false;
+                for next in &block.0[index + 1..] {
+                    match next {
+                        Statement::Empty(_) | Statement::Comment(_) => continue,
+                        Statement::Assign(next_assign)
+                            if !next_assign.prefix
+                                && !next_assign.compound
+                                && next_assign.left.len() == 1
+                                && next_assign.right.len() == 1
+                                && matches!(&next_assign.left[0], LValue::Local(t) if t == local) =>
+                        {
+                            let rhs = &next_assign.right[0];
+                            if !rvalue_reads_local_outside_closures(rhs, local)
+                                && rvalue_captures_local(rhs, local)
+                            {
+                                found = true;
+                            }
+                            break;
+                        }
+                        Statement::If(branch) => {
+                            if !rvalue_reads_or_captures(&branch.condition, local) {
+                                let then_block = branch.then_block.lock();
+                                let else_block = branch.else_block.lock();
+                                if !else_block.0.is_empty()
+                                    && block_writes_before_read(&then_block, local)
+                                    && block_writes_before_read(&else_block, local)
+                                {
+                                    found = true;
+                                }
+                            }
+                            break;
+                        }
+                        other if !statement_touches_local(other, local) => continue,
+                        _ => break,
+                    }
+                }
+                found
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if strip_nil && let Statement::Assign(assign) = &mut block.0[index] {
             assign.right.clear();
         }
+        let statement = &mut block.0[index];
         let mut functions = Vec::new();
         crate::inline_temps::collect_closures_in_statement(statement, &mut |closure| {
             functions.push(closure.function.clone());
@@ -190,5 +360,52 @@ mod tests {
         ]);
         bare_forward_declarations(&mut block);
         assert!(block.to_string().starts_with("local state = nil\n"));
+    }
+
+    #[test]
+    fn self_capturing_connection_forward_decl_drops_nil() {
+        let conn = local("connection");
+        let callback = RValue::Closure(Closure {
+            node_origin: Default::default(),
+            function: ByAddress(Arc::new(Mutex::new(crate::Function::default()))),
+            upvalues: vec![crate::Upvalue::Ref(conn.clone())],
+        });
+        let connect = crate::MethodCall::new(
+            RValue::Global(crate::Global::from("sig")),
+            "Connect".into(),
+            vec![callback],
+        )
+        .into();
+        let mut block = Block(vec![
+            declare_nil(&conn),
+            Assign::new(vec![LValue::Local(conn.clone())], vec![connect]).into(),
+        ]);
+        bare_forward_declarations(&mut block);
+        let text = block.to_string();
+        assert!(text.starts_with("local connection\n"), "{text}");
+        assert!(!text.contains("= nil"), "{text}");
+    }
+
+    #[test]
+    fn branch_initialized_local_with_arm_temp_drops_nil() {
+        let out = local("result");
+        let tmp = local("tmp");
+        let mut tmp_decl = Assign::new(vec![LValue::Local(tmp.clone())], vec![Literal::Number(1.0).into()]);
+        tmp_decl.prefix = true;
+        let branch = crate::If::new(
+            RValue::Global(crate::Global::from("cond")),
+            Block(vec![
+                tmp_decl.into(),
+                Assign::new(vec![LValue::Local(out.clone())], vec![RValue::Local(tmp)]).into(),
+            ]),
+            Block(vec![
+                Assign::new(vec![LValue::Local(out.clone())], vec![Literal::Number(2.0).into()]).into(),
+            ]),
+        );
+        let mut block = Block(vec![declare_nil(&out), branch.into()]);
+        bare_forward_declarations(&mut block);
+        let text = block.to_string();
+        assert!(text.starts_with("local result\n"), "{text}");
+        assert!(!text.contains("= nil"), "{text}");
     }
 }

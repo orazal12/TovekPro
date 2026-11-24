@@ -1,11 +1,34 @@
 <h1><picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/tovek-logo-dark.svg">
-  <img alt="Tovek" src="docs/assets/brand/tovek-logo.svg" height="64">
+  <img alt="TovekPro" src="docs/assets/brand/tovek-logo.svg" height="64">
 </picture></h1>
 
-**A high-readability, high-performance Luau decompiler.** **Tovek V2.7**
+**TovekPro — an ultra-readable, high-performance Luau decompiler.** Forked from [Tovek V2.7](https://github.com/Kiet1308/Tovek) (itself a fork of [medal](https://github.com/Stefanuk12/medal-decompiler)).
 
-[**Download V2.7 for Windows, Linux or macOS**](https://github.com/Kiet1308/Tovek/releases/tag/v2.7) · [What’s new in V2.7](https://kiet1308.github.io/Tovek/changelog/v2.7/) · [All release notes](https://kiet1308.github.io/Tovek/changelog.html)
+### What's new in TovekPro
+
+- **Deeper variable, parameter, and class naming:**
+  - Recovers OOP class names from `__className` fields and strict metatable errors (`Attempt to get Connection::%s` -> `Connection`, `Signal`), preserves PascalCase on class tables (`Error` instead of `err`), and names non-empty class tables and 2-step `local self = {}; ...; setmetatable(self, Class)` constructors cleanly.
+  - Preserves variable roles through linked-list / parent-chain walks (`node = node._next`, `cur = cur.Parent`) and cache deletions (`cache[key] = nil`).
+  - Expands Luau stdlib & Roblox API naming: `rawget(t, "Key")`, `newproxy()` markers/proxies, `task.wait()` -> `dt`, `math.clamp`, `string.split`, `buffer.fromstring`, `table.remove` element singularization, `FindPartOnRay*` / `coroutine.resume` / `string.find` multi-return tuples, `xpcall` error handler `err`, `GetAsync` -> `data`, `FindFirst*OfClass`/`WhichIsA` class names, ValueBase `.Value` derefs, `(a - b).Unit` -> `direction`, `os.clock() - start` -> `elapsed`, uppercase `.X/.Y/.Z` vector params, and 15+ additional Roblox event signatures (`Chatted`, `TouchTap`, `Blocked`, `GetInstanceAddedSignal`, `FocusLost`, `HealthChanged`, `StateChanged`, `AttributeChanged`, `Activated`, etc.).
+  - Smarter loop & iterator naming (`Players:GetPlayers()`, `:GetAttributes()`, `:GetTags()`, `:GetTagged()`, `string.gmatch`, `utf8.codes`, `XByY`/`XToY` map keys, array-like `for i, v` indices, and trailing qualifiers like `playersNear` -> `player`).
+  - Plain-English assertion parameter recovery (`assert(traceback ~= nil, "traceback is nil")`) and early-return guard function return-role propagation.
+- **Stronger OOP colon-method recovery:**
+  - Runs a second post-cleanup recovery pass so methods exposed by temp inlining and copy cleanup (`Promise.prototype:_resolve`, `Promise.prototype:now`) recover cleanly.
+  - Class-consistency sweep recovers pure getters and unused-`self` methods on established OOP classes.
+- **Cleaner control flow, copies, and formatting:**
+  - NaN-safe De Morgan in late guard negation (`not (a ~= b and c ~= d)` -> `a == b or c == d`).
+  - Keeps early-return guards intact above large `else` blocks so main paths stay un-indented.
+  - Collapses multi-arm boolean `if/elseif/else` chains into short-circuit `or`/`and` (`devtools == nil or typeof(devtools) == "table" and ...`), re-runs self-guard folding after temp cleanup, expands huge closure-in-`and/or` assignments back to `if/else`, and chains trailing `if scrutinee == LIT` arms onto existing `if/elseif` chains.
+  - Window-scoped `copy_cleanup` (`local v = x; use(v); x = 1` -> `use(x); x = 1`), bare branch-initialized forward declarations, forward-declared / diverging-`error` untruncation, un-parenthesized call receivers (`getT().k`), single-arg overlong call wrapping, and bit-exact `Vector3.zero`/`one`/`xAxis`/`yAxis`/`zAxis` constants under `--assume-standard-libraries`.
+- **`--pro` maximum-readability preset & `--clean-comments`:**
+  - Pass `--pro` on CLI (`luau-lifter`, `decompile-folder`, `validate-folder`) or `X-Decompile-Flags: PRO` on `web-server` / `luau-worker` to enable `--style compact`, `--assume-standard-libraries`, `--assume-no-nan`, and `--clean-comments` (omitting diagnostic `-- inferred equivalent call` / `-- parallel` / `[DEDUP]` comments while keeping `--!native`). Both executor client scripts enable `USE_PRO_MODE = true` by default.
+
+---
+
+### Upstream Tovek V2.7 Overview
+
+[**Upstream Tovek V2.7 releases**](https://github.com/Kiet1308/Tovek/releases/tag/v2.7) · [What’s new in V2.7](https://kiet1308.github.io/Tovek/changelog/v2.7/) · [All release notes](https://kiet1308.github.io/Tovek/changelog.html)
 
 Builds are published for Windows x86_64, Linux x86_64, Linux aarch64 and macOS on Apple silicon. Each package holds the two programs, `luau-lifter` (CLI) and `web-server` (local HTTP server), plus the licence; the executor client scripts live in this repository. The release tag is `v2.7`; Rust package versions are `2.7.0`.
 

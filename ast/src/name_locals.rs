@@ -269,6 +269,25 @@ fn index_hint(index: &Index) -> Option<String> {
         {
             return sanitize(&format!("{key}{}", capitalize_first(library)));
         }
+        // `(a - b).Unit`: unit vector of a displacement is a direction.
+        if key == "Unit"
+            && matches!(
+                &*index.left,
+                RValue::Binary(binary) if binary.operation == BinaryOperation::Sub
+            )
+        {
+            return Some("direction".to_string());
+        }
+        // `stats.HealthValue.Value` -> `health` (ValueBase wrapper dereference).
+        if key == "Value"
+            && let RValue::Index(inner) = &*index.left
+            && let Some(inner_key) = index_key(inner)
+            && let Some(stem) = inner_key.strip_suffix("Value")
+            && stem.len() >= 2
+            && let Some(name) = sanitize(stem)
+        {
+            return Some(name);
+        }
         return sanitize(key);
     }
     None
@@ -313,29 +332,65 @@ fn call_hint_of(callee: &RValue, arguments: &[RValue]) -> Option<String> {
         let argument_count = arguments.len();
         // A single-argument numeric/string/state transform is transparent for
         // naming: `math.floor(x.Y)` is still `y`, `peek(state.Key)` is `key`.
-        if argument_count == 1
+        // `math.clamp(x, min, max)` likewise preserves its clamped value's name.
+        if ((argument_count == 1
             && matches!(
                 (namespace, member),
                 (None, "peek")
                     | (Some("math"), "floor" | "ceil" | "round" | "abs" | "sqrt" | "rad" | "deg" | "sign")
                     | (Some("string"), "lower" | "upper")
                     | (Some("table"), "freeze")
-            )
+            ))
+            || (argument_count == 3 && matches!((namespace, member), (Some("math"), "clamp"))))
             && let Some(name) = rvalue_hint(&arguments[0])
         {
             return Some(name);
+        }
+        // `table.freeze({ "Destroy", "Disconnect", ... })`: a non-empty array of
+        // literal strings is a list of names/values, not an un-pluralizable `"frozen"`.
+        if matches!((namespace, member), (Some("table"), "freeze"))
+            && let Some(RValue::Table(table)) = arguments.first()
+            && !table.0.is_empty()
+            && table.0.iter().all(|(k, v)| k.is_none() && string_literal(v).is_some())
+        {
+            let all_methods = table.0.iter().all(|(_, v)| {
+                string_literal(v).is_some_and(|s| {
+                    matches!(
+                        s,
+                        "Destroy" | "destroy" | "Disconnect" | "disconnect" | "Cancel" | "cancel"
+                            | "Clean" | "clean" | "Cleanup" | "cleanup" | "Dispose" | "dispose"
+                    )
+                })
+            });
+            return Some(if all_methods { "cleanupMethods" } else { "items" }.to_string());
         }
         match (namespace, member) {
             (None, "typeof" | "type") if argument_count == 1 => {
                 return Some("typeName".to_string());
             }
             (None, "getmetatable") => return Some("metatable".to_string()),
+            (None, "rawget") if argument_count == 2 => {
+                if let Some(key) = arguments.get(1).and_then(string_literal)
+                    && let Some(name) = sanitize(key.trim_start_matches('_'))
+                {
+                    return Some(name);
+                }
+            }
+            (None, "newproxy") => {
+                let with_mt = matches!(arguments.first(), Some(RValue::Literal(Literal::Boolean(true))));
+                return Some(if with_mt { "proxy" } else { "marker" }.to_string());
+            }
+            (None, "select") if matches!(arguments.first().and_then(string_literal), Some("#")) => {
+                return Some("argCount".to_string());
+            }
             (Some("coroutine"), "running" | "create" | "wrap")
             | (Some("task"), "spawn" | "defer" | "delay") => return Some("thread".to_string()),
+            (Some("task"), "wait") => return Some("dt".to_string()),
             (Some("table"), "find") => return Some("index".to_string()),
+            (Some("string"), "split") => return Some("parts".to_string()),
             (Some("debug"), "traceback") => return Some("traceback".to_string()),
             (Some("vector"), "create") => return Some("vector".to_string()),
-            (Some("buffer"), "create") => return Some("buf".to_string()),
+            (Some("buffer"), "create" | "fromstring") => return Some("buf".to_string()),
             // Fusion scoping helpers always yield a scope.
             (_, "scoped" | "innerScope" | "deriveScope") => return Some("scope".to_string()),
             // A keyed getter reads the value stored under its key
@@ -632,6 +687,18 @@ fn method_call_hint(method_call: &MethodCall) -> Option<String> {
     {
         return std::str::from_utf8(arg).ok().and_then(sanitize_pascal);
     }
+    if matches!(
+        method,
+        "FindFirstChildOfClass"
+            | "FindFirstChildWhichIsA"
+            | "FindFirstAncestorOfClass"
+            | "FindFirstAncestorWhichIsA"
+    ) && let Some(RValue::Literal(Literal::String(arg))) = method_call.arguments.first()
+    {
+        return std::str::from_utf8(arg)
+            .ok()
+            .and_then(|class_name| class_name_hint(class_name).or_else(|| sanitize(class_name)));
+    }
     if (method.starts_with("FindFirst") || method.starts_with("WaitFor"))
         && let Some(RValue::Literal(Literal::String(arg))) = method_call.arguments.first()
     {
@@ -661,6 +728,9 @@ fn method_call_hint(method_call: &MethodCall) -> Option<String> {
         // misleading form (it *is* a RaycastResult) and avoids colliding with the
         // generic `result` minted by the pcall-tuple / loop-fill hints.
         "Raycast" => return Some("raycastResult".to_string()),
+        "JSONEncode" => return Some("json".to_string()),
+        "JSONDecode" => return Some("decoded".to_string()),
+        "split" => return Some("parts".to_string()),
         _ => {}
     }
     // A keyed getter reads the value stored under its key
@@ -670,10 +740,14 @@ fn method_call_hint(method_call: &MethodCall) -> Option<String> {
     {
         return Some(name);
     }
-    // Getter-style methods: obj:GetChildren() -> "children", obj:GetMouse() -> "mouse"
+    // Getter-style methods: obj:GetChildren() -> "children", obj:GetMouse() -> "mouse".
+    // Bare `GetAsync` yields `data` rather than the non-noun `async`.
     if let Some(rest) = method.strip_prefix("Get")
         && !rest.is_empty()
     {
+        if rest == "Async" {
+            return Some("data".to_string());
+        }
         return sanitize(rest);
     }
     // A class-name factory (`scope:New("Frame")`, Fusion's `New`) names its
@@ -855,6 +929,48 @@ fn boolean_compare_hint(rvalue: &RValue) -> Option<String> {
 /// the receiver's name (`plantedSeeds` + `Client` -> `plantedSeedsClient`). Kept
 /// small and structural on purpose: a specific child (`PlantedSeeds`, `Humanoid`)
 /// is informative alone and must stay bare.
+/// Extract a PascalCase class name from a strict-class metamethod error string,
+/// e.g. `error(("Attempt to get Connection::%s"):format(...))` -> `"Connection"`.
+fn class_name_from_metamethod(body: &Block) -> Option<String> {
+    fn from_rvalue(value: &RValue) -> Option<String> {
+        if let Some(s) = string_literal(value) {
+            for prefix in ["Attempt to get ", "Attempt to set ", "Attempt to index "] {
+                if let Some(rest) = s.strip_prefix(prefix)
+                    && let Some(sep) = rest.find("::")
+                {
+                    let candidate = &rest[..sep];
+                    if candidate.len() >= 2
+                        && candidate.starts_with(|c: char| c.is_ascii_uppercase())
+                        && candidate.contains(|c: char| c.is_ascii_lowercase())
+                        && candidate.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && !crate::name_spelling::soft_reserved(candidate)
+                    {
+                        return sanitize_preserve(candidate);
+                    }
+                }
+            }
+        }
+        let mut found = None;
+        value.visit_rvalues(&mut |child| {
+            if found.is_none() {
+                found = from_rvalue(child);
+            }
+            found.is_none()
+        });
+        found
+    }
+    for stmt in &body.0 {
+        if let Statement::Call(call) = stmt
+            && global_name(&call.value) == Some("error")
+            && let Some(arg) = call.arguments.first()
+            && let Some(name) = from_rvalue(arg)
+        {
+            return Some(name);
+        }
+    }
+    None
+}
+
 fn is_generic_lookup_child(name: &str) -> bool {
     matches!(
         name,
@@ -1576,15 +1692,30 @@ fn callable_static_name(rvalue: &RValue) -> Option<&str> {
 }
 
 fn protected_call_result_hint(rvalue: &RValue) -> Option<String> {
-    let RValue::Index(index) = rvalue else {
-        return None;
-    };
-    let key = index_key(index)?;
-    let getter_name = key
-        .strip_prefix("Get")
-        .or_else(|| key.strip_prefix("Find"))
-        .filter(|rest| !rest.is_empty())?;
-    sanitize(getter_name)
+    match rvalue {
+        RValue::Index(index) => {
+            let key = index_key(index)?;
+            let getter_name = key
+                .strip_prefix("Get")
+                .or_else(|| key.strip_prefix("Find"))
+                .filter(|rest| !rest.is_empty())?;
+            if getter_name == "Async" {
+                return Some("data".to_string());
+            }
+            sanitize(query_result_noun(getter_name))
+        }
+        RValue::Closure(closure) => {
+            let function = closure.function.lock();
+            if let Some(Statement::Return(ret)) = function.body.last()
+                && ret.values.len() == 1
+                && function.body.len() == 1
+            {
+                return rvalue_hint(&ret.values[0]);
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 // Naming can see a saved iterator without moving its lookup past the argument.
@@ -1627,11 +1758,40 @@ fn iterator_names(right: &[RValue], aliases: &FxHashMap<usize, RValue>) -> Optio
             _ => None,
         }
     }
+    fn generator_lib_call<'a>(rvalue: &'a RValue, aliases: &'a FxHashMap<usize, RValue>) -> Option<(&'a str, &'a str)> {
+        let (RValue::Call(call) | RValue::Select(Select::Call(call))) = rvalue else {
+            return None;
+        };
+        let callee = match &*call.value {
+            RValue::Local(local) => aliases.get(&local_ptr(local)).unwrap_or(&call.value),
+            callee => callee,
+        };
+        match static_callee_of(callee) {
+            Some((Some(ns), member)) => Some((ns, member)),
+            _ => None,
+        }
+    }
     for rvalue in right {
         if let Some(method) = generator_method(rvalue, aliases) {
             match method {
                 "GetChildren" => return Some(vec!["i", "child"]),
                 "GetDescendants" => return Some(vec!["i", "descendant"]),
+                "GetPlayers" => return Some(vec!["i", "player"]),
+                "GetAttributes" => return Some(vec!["attr", "value"]),
+                "GetTags" => return Some(vec!["i", "tag"]),
+                "GetTagged" => return Some(vec!["i", "instance"]),
+                "GetPartsInPart" | "GetTouchingParts" | "GetPartBoundsInBox"
+                | "GetPartBoundsInRadius" => return Some(vec!["i", "part"]),
+                "split" => return Some(vec!["i", "part"]),
+                "gmatch" => return Some(vec!["match"]),
+                _ => {}
+            }
+        }
+        if let Some((ns, member)) = generator_lib_call(rvalue, aliases) {
+            match (ns, member) {
+                ("string", "gmatch") => return Some(vec!["match"]),
+                ("string", "split") => return Some(vec!["i", "part"]),
+                ("utf8", "codes") => return Some(vec!["pos", "codepoint"]),
                 _ => {}
             }
         }
@@ -1791,12 +1951,46 @@ fn element_name(collection: &str) -> Option<String> {
         let target = &base[at + 2..];
         return sanitize(&format!("{}{}", target[..1].to_ascii_lowercase(), &target[1..]));
     }
-    for suffix in ["List", "Array", "Map", "Dict", "Lookup", "Registry"] {
+    for suffix in ["List", "Array", "Map", "Dict", "Lookup", "Registry", "Cache", "Set"] {
         if let Some(stem) = base.strip_suffix(suffix)
             && boundary(stem.len())
         {
             return singularize(stem).or_else(|| sanitize(stem));
         }
+    }
+    // Trailing filter/spatial qualifier after a plural head: `playersNear` -> `player`,
+    // `partsInRange` -> `part`.
+    for qualifier in ["Near", "InRange", "InView", "Active", "Found", "Left", "Ready", "Alive", "Valid"] {
+        if let Some(stem) = base.strip_suffix(qualifier)
+            && boundary(stem.len())
+            && let Some(singular) = singularize(stem)
+        {
+            return Some(singular);
+        }
+    }
+    None
+}
+
+/// Key name for a map named `valuesByKey` (`modelsByPlayer` -> `player`) or
+/// `keyToValue` (`zoneIdToZoneObj` -> `zoneId`).
+fn map_key_name(collection: &str) -> Option<String> {
+    let base = collection.trim_end_matches(|c: char| c.is_ascii_digit());
+    let boundary = |at: usize| {
+        at > 0
+            && base.as_bytes().get(at).is_some_and(u8::is_ascii_uppercase)
+            && base.as_bytes()[at - 1].is_ascii_lowercase()
+    };
+    if let Some(at) = base.find("By").filter(|&at| {
+        boundary(at) && base.as_bytes().get(at + 2).is_some_and(u8::is_ascii_uppercase)
+    }) {
+        let key = &base[at + 2..];
+        return sanitize(key);
+    }
+    if let Some(at) = base.find("To").filter(|&at| {
+        boundary(at) && base.as_bytes().get(at + 2).is_some_and(u8::is_ascii_uppercase)
+    }) && ["Id", "Name", "Key", "Index"].iter().any(|suffix| base[..at].ends_with(suffix))
+    {
+        return sanitize(&base[..at]);
     }
     None
 }
@@ -2196,6 +2390,8 @@ struct LocalUsage {
     /// Receiver of a method that is neither a string nor an Instance method
     /// (`local:PauseRender()`): a user object.
     custom_method_seen: bool,
+    /// Passed as the first argument to `setmetatable(local, meta)` (2-step constructor).
+    setmetatable_target: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -2275,6 +2471,11 @@ fn note_map_key(local: &RcLocal, key: &RValue, usage: &mut FxHashMap<usize, Loca
 }
 
 fn note_collection_fill(local: &RcLocal, value: &RValue, usage: &mut FxHashMap<usize, LocalUsage>) {
+    // Clearing a cache/map entry (`cache[key] = nil`) deletes an entry rather than
+    // storing an unknown element type; ignore it so the map keeps its value consensus.
+    if matches!(value, RValue::Literal(Literal::Nil)) {
+        return;
+    }
     let entry = usage.entry(local_ptr(local)).or_default();
     if matches!(value, RValue::Literal(Literal::Boolean(true))) {
         entry.true_fills += 1;
@@ -2392,6 +2593,9 @@ fn keeps_assignment_role(local: &RcLocal, value: &RValue) -> bool {
             BinaryOperation::Add | BinaryOperation::Sub | BinaryOperation::Mul | BinaryOperation::Div
             | BinaryOperation::IDiv | BinaryOperation::Mod | BinaryOperation::Pow)
             && (is_self(&binary.left) || is_self(&binary.right)),
+        // Linked-list / parent-chain traversal (`node = node._next`, `cur = cur.Parent`):
+        // stepping through a link field keeps the traversal variable's initial role.
+        RValue::Index(index) => is_self(&index.left) && string_literal(&index.right).is_some(),
         // `x = lerp(x, goal, t)`, `s = s:lower()`: the value transformed in place.
         RValue::Call(call) | RValue::Select(Select::Call(call)) => call.arguments.iter().any(is_self),
         RValue::MethodCall(call) | RValue::Select(Select::MethodCall(call)) => {
@@ -2579,6 +2783,7 @@ fn note_call_usage(
             (b"task", "wait") => &["duration"],
             (b"task", "delay") => &["duration", "callback"],
             (b"task", "spawn" | "defer") | (b"coroutine", "wrap" | "create") => &["callback"],
+            (b"task", "cancel") | (b"coroutine", "status" | "close" | "resume") => &["thread"],
             (b"string", "format") => &["formatString"],
             // The sequence-taking `table` operations: the first argument is an
             // array (`list`), never a record.
@@ -2589,6 +2794,10 @@ fn note_call_usage(
             ) => &["list"],
             (b"Instance", "new") => &["className", "parent"],
             (b"CFrame", "new") if call.arguments.len() == 1 => &["position"],
+            (b"CFrame", "lookAt") => &["origin", "target"],
+            (b"CFrame", "Angles") => &["rx", "ry", "rz"],
+            (b"Color3", "fromRGB") => &["r", "g", "b"],
+            (b"Color3", "fromHSV") => &["h", "s", "v"],
             (b"TweenInfo", "new") => &["duration"],
             // Naming metadata only; syntactic globals do not prove runtime
             // API identity, purity, totality, or author-written annotations.
@@ -2639,6 +2848,12 @@ fn note_call_usage(
             b"error" => &["message"],
             b"require" => &["moduleScript"],
             b"pcall" | b"xpcall" => &["callback"],
+            b"setmetatable" => {
+                if let Some(RValue::Local(target)) = call.arguments.first() {
+                    usage.entry(local_ptr(target)).or_default().setmetatable_target = true;
+                }
+                &[]
+            }
             _ => &[],
         };
         for (argument, slot) in call.arguments.iter().zip(slots) {
@@ -2866,6 +3081,8 @@ fn note_method_arg_usage(method_call: &MethodCall, usage: &mut FxHashMap<usize, 
         "Raycast" => &["origin", "direction", "raycastParams"],
         "Create" if args.len() == 3 && receiver_tweens => &["instance", "tweenInfo", "goal"],
         "BulkMoveTo" => &["parts", "cframes"],
+        "BindToRenderStep" => &["name", "priority", "callback"],
+        "UnbindFromRenderStep" => &["name"],
         _ => &[],
     };
     for (argument, slot) in args.iter().zip(slots) {
@@ -3659,6 +3876,10 @@ struct Namer {
     /// table declaration `local X = {}` to name the class table `class`.
     /// See `collect_class_signals`.
     class_signal_locals: FxHashSet<usize>,
+    /// Locals passed as the metatable (2nd arg) of `setmetatable(_, X)`.
+    metatable_arg_locals: FxHashSet<usize>,
+    /// Locals that define `X.__index = ...` (either by field assignment or inline table key).
+    index_metamethod_locals: FxHashSet<usize>,
 }
 
 struct ParamConsensus {
@@ -4031,6 +4252,15 @@ impl Namer {
             .and_then(|callable| {
                 if global_name(callable) == Some("require") {
                     call.arguments.get(first_argument).and_then(base_name_of)
+                } else if let RValue::Index(index) = callable
+                    && index_key(index) == Some("GetService")
+                    && let Some(service) = call.arguments.get(first_argument + 1).and_then(string_literal)
+                {
+                    sanitize_pascal(service)
+                } else if let RValue::Local(local) = callable {
+                    self.local_known_name(local)
+                        .as_deref()
+                        .and_then(helper_result_noun)
                 } else {
                     protected_call_result_hint(callable)
                 }
@@ -4039,6 +4269,48 @@ impl Namer {
 
         if let Some(result) = assign.left[left_start + 1].as_local() {
             self.set_hint(result, result_hint, 80);
+        }
+    }
+
+    /// Multi-return stdlib / Roblox API call tuple hints:
+    /// - `coroutine.resume(co, ...)` -> `ok, result`
+    /// - `string.find(s, pat)` / `s:find(pat)` -> `startPos, endPos`
+    /// - `Workspace:FindPartOnRay*` -> `hitPart, hitPosition, hitNormal, hitMaterial`
+    fn apply_api_tuple_hints(&mut self, assign: &crate::Assign, rvalue: &RValue, left_start: usize) {
+        if assign.left.len() < left_start + 2 {
+            return;
+        }
+        let slots: &[(&str, u8)] = match rvalue {
+            RValue::Call(call) | RValue::Select(Select::Call(call)) => {
+                let callee = match &*call.value {
+                    RValue::Local(local) => self.callee_aliases.get(&local_ptr(local)).unwrap_or(&call.value),
+                    callee => callee,
+                };
+                match static_callee_of(callee) {
+                    Some((Some("coroutine"), "resume")) => &[("ok", 85), ("result", 80)],
+                    Some((Some("string"), "find")) => &[("startPos", 60), ("endPos", 60)],
+                    _ => return,
+                }
+            }
+            RValue::MethodCall(call) | RValue::Select(Select::MethodCall(call)) => {
+                match call.method.as_str() {
+                    "FindPartOnRay" | "FindPartOnRayWithIgnoreList" | "FindPartOnRayWithWhitelist" => &[
+                        ("hitPart", 60),
+                        ("hitPosition", 60),
+                        ("hitNormal", 60),
+                        ("hitMaterial", 60),
+                    ],
+                    "find" => &[("startPos", 60), ("endPos", 60)],
+                    "await" | "Await" => &[("ok", 65), ("value", 60)],
+                    _ => return,
+                }
+            }
+            _ => return,
+        };
+        for (offset, &(name, score)) in slots.iter().enumerate() {
+            if let Some(local) = assign.left.get(left_start + offset).and_then(|lv| lv.as_local()) {
+                self.set_hint_str(local, name, score);
+            }
         }
     }
 
@@ -4085,7 +4357,7 @@ impl Namer {
         };
 
         match method_call.method.as_str() {
-            "GetDescendants" => self.set_hint_str(local, "folder", 55),
+            "GetDescendants" => self.set_hint_str(local, "folder", 47),
             "IsA" => {
                 if let Some(class_name) = method_call.arguments.first().and_then(string_literal) {
                     self.set_isa_hint(local, class_name);
@@ -4253,10 +4525,19 @@ impl Namer {
     /// `callable_name` (its name lives on the closure hint set earlier in this
     /// top-down collect); a callee whose name isn't yet known is a safe no-op.
     fn predicate_call_hint(&self, rvalue: &RValue) -> Option<String> {
-        let (RValue::Call(call) | RValue::Select(Select::Call(call))) = rvalue else {
-            return None;
+        let name = match rvalue {
+            RValue::Call(call) | RValue::Select(Select::Call(call)) => self.callable_name(&call.value)?,
+            RValue::MethodCall(call) | RValue::Select(Select::MethodCall(call)) => {
+                if call.method == "IsA"
+                    && let Some(class_name) = call.arguments.first().and_then(string_literal)
+                {
+                    let stem = class_name_hint(class_name).or_else(|| sanitize(class_name))?;
+                    return sanitize_preserve(&format!("is{}", capitalize_first(&stem)));
+                }
+                call.method.clone()
+            }
+            _ => return None,
         };
-        let name = self.callable_name(&call.value)?;
         sanitize(strip_predicate_prefix(crate::name_spelling::strip_private(&name))?)
     }
 
@@ -4368,7 +4649,18 @@ impl Namer {
 
     fn collection_element_name(&self, right: &[RValue]) -> Option<String> {
         for rvalue in right {
-            let name = match unwrap_iter_arg(rvalue, &self.callee_aliases) {
+            let unwrapped = unwrap_iter_arg(rvalue, &self.callee_aliases);
+            if let RValue::MethodCall(call) | RValue::Select(Select::MethodCall(call)) = unwrapped {
+                if call.method == "GetTagged"
+                    && let Some(tag) = call.arguments.first().and_then(string_literal)
+                    && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    if let Some(name) = element_name(tag).or_else(|| sanitize(tag)) {
+                        return Some(name);
+                    }
+                }
+            }
+            let name = match unwrapped {
                 RValue::Local(local) => self.local_known_name(local),
                 RValue::Index(index) => index_key(index).map(str::to_string),
                 _ => None,
@@ -4380,6 +4672,31 @@ impl Namer {
             }
         }
         None
+    }
+
+    fn collection_key_name(&self, right: &[RValue]) -> Option<String> {
+        for rvalue in right {
+            let name = match unwrap_iter_arg(rvalue, &self.callee_aliases) {
+                RValue::Local(local) => self.local_known_name(local),
+                RValue::Index(index) => index_key(index).map(str::to_string),
+                _ => None,
+            };
+            if let Some(name) = name
+                && let Some(key) = map_key_name(&name)
+            {
+                return Some(key);
+            }
+        }
+        None
+    }
+
+    fn iterates_array_like_local(&self, right: &[RValue]) -> bool {
+        right.first().is_some_and(|value| {
+            matches!(unwrap_iter_arg(value, &self.callee_aliases), RValue::Local(local)
+                if self.usage.get(&local_ptr(local)).is_some_and(|usage| {
+                    usage.length_taken || usage.numeric_indexed || usage.table_insert_in_loop
+                }))
+        })
     }
 
     /// A local initialized to a table literal that is filled with React elements
@@ -4438,6 +4755,73 @@ impl Namer {
     }
 
     /// Declaration-only naming rules that need whole-tree facts or serve as a
+    fn is_position_like(&self, value: &RValue) -> bool {
+        match value {
+            RValue::Index(index) => matches!(
+                index_key(index),
+                Some("Position" | "LookVector" | "RightVector" | "UpVector" | "Velocity" | "Size")
+            ),
+            RValue::Local(local) => self.local_known_name(local).is_some_and(|name| {
+                let lower = name.to_ascii_lowercase();
+                lower.ends_with("position")
+                    || lower.ends_with("pos")
+                    || lower.ends_with("point")
+                    || lower.ends_with("vector")
+                    || lower.ends_with("origin")
+                    || lower.ends_with("center")
+            }),
+            RValue::Call(call) | RValue::Select(Select::Call(call)) => {
+                matches!(static_callee(call), Some((Some("Vector3" | "Vector2" | "vector"), "new" | "create")))
+            }
+            RValue::Literal(Literal::Vector(..) | Literal::VectorD(..)) => true,
+            _ => false,
+        }
+    }
+
+    fn hint_dynamic_method_dispatch(&mut self, call: &Call) {
+        if let RValue::Index(index) = &*call.value
+            && let RValue::Local(obj) = &*index.left
+            && let RValue::Local(key) = &*index.right
+            && let Some(RValue::Local(arg0)) = call.arguments.first()
+            && local_ptr(arg0) == local_ptr(obj)
+        {
+            self.set_hint_str(key, "methodName", 45);
+        }
+    }
+
+    fn hint_member_closure_params(&mut self, key: &str, closure: &crate::Closure) {
+        let function = closure.function.lock();
+        let params = &function.parameters;
+        match key {
+            "__index" if params.len() == 2 => {
+                self.set_hint_str(&params[1], "key", 55);
+            }
+            "__newindex" if params.len() == 3 => {
+                self.set_hint_str(&params[1], "key", 55);
+                self.set_hint_str(&params[2], "value", 55);
+            }
+            "is" | "Is" if params.len() == 1 => {
+                self.set_hint_str(&params[0], "value", 48);
+            }
+            _ => {
+                if let Some(rest) = key.strip_prefix("Set").or_else(|| key.strip_prefix("set"))
+                    && rest.starts_with(|c: char| c.is_ascii_uppercase())
+                    && !matches!(rest, "Metatable")
+                    && let Some(param) = match params.len() {
+                        1 => Some(&params[0]),
+                        2 => Some(&params[1]),
+                        _ => None,
+                    }
+                    && let Some(name) = sanitize(rest)
+                {
+                    self.set_hint(param, name, 45);
+                }
+            }
+        }
+    }
+
+    /// Last-resort declaration-only hints for expression shapes not covered by
+    /// the static layers above (`setmetatable`, `#x`, `items[i]`, callee noun).
     /// last resort. All are `+lines`-safe: every movable RHS shape is gated on
     /// the local NOT being an inlinable temp; a call/index/binary RHS is never
     /// inlined by the AST temp pass, so naming it is unconditional.
@@ -4446,17 +4830,50 @@ impl Namer {
         match rvalue {
             // `local v = setmetatable({}, Class)`: the constructed object. A
             // returned one is the idiomatic `self` of a constructor; otherwise
-            // the honest `object`.
+            // the honest `object` (unless this table itself is a subclass/metatable
+            // with `__index`, which belongs to `"class"`).
             RValue::Call(call) | RValue::Select(Select::Call(call))
                 if global_name(&call.value) == Some("setmetatable") =>
+            {
+                let ptr = local_ptr(local);
+                if self.metatable_arg_locals.contains(&ptr) || self.index_metamethod_locals.contains(&ptr) {
+                    self.set_hint_str(local, "class", 36);
+                } else {
+                    let returned = self
+                        .usage
+                        .get(&ptr)
+                        .is_some_and(|usage| usage.returned);
+                    // A captured `self` would be an upvalue named `self` inside the
+                    // nested closures, which blocks their own `p0 -> self` method
+                    // recovery; a chunk-level object is a module, not a `self`.
+                    let captured = self
+                        .counts
+                        .get(&ptr)
+                        .is_some_and(|u| u.captured);
+                    let name = if returned && !captured && self.receiver_like_depth == 0 && !self.at_root
+                    {
+                        "self"
+                    } else {
+                        "object"
+                    };
+                    self.set_hint_str(local, name, 58);
+                }
+            }
+            // 2-step constructor: `local self = {}; ...; setmetatable(self, Class); return self`.
+            // Skip class prototypes that are themselves metatables or define `__index`.
+            RValue::Table(_)
+                if !inlinable_temp
+                    && self
+                        .usage
+                        .get(&local_ptr(local))
+                        .is_some_and(|usage| usage.setmetatable_target)
+                    && !self.metatable_arg_locals.contains(&local_ptr(local))
+                    && !self.index_metamethod_locals.contains(&local_ptr(local)) =>
             {
                 let returned = self
                     .usage
                     .get(&local_ptr(local))
                     .is_some_and(|usage| usage.returned);
-                // A captured `self` would be an upvalue named `self` inside the
-                // nested closures, which blocks their own `p0 -> self` method
-                // recovery; a chunk-level object is a module, not a `self`.
                 let captured = self
                     .counts
                     .get(&local_ptr(local))
@@ -4468,6 +4885,118 @@ impl Namer {
                     "object"
                 };
                 self.set_hint_str(local, name, 58);
+            }
+            // `local args = { ... }`: variadic argument pack.
+            RValue::Table(table)
+                if !inlinable_temp
+                    && matches!(table.0.as_slice(), [(None, RValue::VarArg(_))]) =>
+            {
+                self.set_hint_str(local, "args", 52);
+            }
+            // `local item = table.remove(items, ...)`: element removed from a named collection.
+            RValue::Call(call) | RValue::Select(Select::Call(call))
+                if static_callee(call) == Some((Some("table"), "remove")) =>
+            {
+                if let Some(RValue::Local(collection)) = call.arguments.first()
+                    && let Some(collection_name) = self.local_known_name(collection)
+                    && let Some(element) = element_name(&collection_name)
+                {
+                    self.set_hint(local, element, 50);
+                }
+            }
+            // `local signal = Signal.new(...)`: PascalCase local class constructor.
+            RValue::Call(call) | RValue::Select(Select::Call(call))
+                if matches!(
+                    &*call.value,
+                    RValue::Index(index) if index_key(index) == Some("new")
+                ) =>
+            {
+                if let RValue::Index(index) = &*call.value
+                    && let RValue::Local(class_local) = &*index.left
+                    && let Some(class_name) = self.local_known_name(class_local)
+                    && class_name.starts_with(|c: char| c.is_ascii_uppercase())
+                    && !matches!(class_name.as_str(), "Class" | "Object" | "Module")
+                    && let Some(instance_name) = sanitize(&class_name)
+                {
+                    self.set_hint(local, instance_name, 55);
+                }
+            }
+            // `local elapsed = os.clock() - startTime` / `tick() - lastTime`.
+            RValue::Binary(binary)
+                if !inlinable_temp
+                    && binary.operation == BinaryOperation::Sub
+                    && is_time_read(&binary.left) =>
+            {
+                self.set_hint_str(local, "elapsed", 52);
+            }
+            // `local delta = posA - posB` (vector/position difference).
+            RValue::Binary(binary)
+                if !inlinable_temp
+                    && binary.operation == BinaryOperation::Sub
+                    && self.is_position_like(&binary.left)
+                    && self.is_position_like(&binary.right) =>
+            {
+                self.set_hint_str(local, "delta", 42);
+            }
+            // `local opts = options or {}`: default empty-table fallback inherits LHS name.
+            RValue::Binary(binary)
+                if !inlinable_temp
+                    && binary.operation == BinaryOperation::Or
+                    && matches!(&*binary.right, RValue::Table(t) if t.0.is_empty())
+                    && let RValue::Local(src) = &*binary.left =>
+            {
+                if let Some(name) = self.local_known_name(src)
+                    && !is_default_name(&name)
+                {
+                    self.set_hint(local, name, 52);
+                }
+            }
+            // `local flag = success and result`: guarded value inherits RHS local's name.
+            RValue::Binary(binary)
+                if !inlinable_temp
+                    && binary.operation == BinaryOperation::And
+                    && let RValue::Local(guard) = &*binary.left
+                    && let RValue::Local(val) = &*binary.right =>
+            {
+                let guard_is_bool = self.local_known_name(guard).is_some_and(|n| {
+                    matches!(n.as_str(), "ok" | "success" | "found" | "valid" | "flag")
+                        || n.starts_with("is")
+                        || n.starts_with("has")
+                        || n.starts_with("can")
+                        || n.starts_with("should")
+                });
+                if guard_is_bool
+                    && let Some(val_name) = self.local_known_name(val)
+                    && !is_default_name(&val_name)
+                {
+                    self.set_hint(local, val_name, 50);
+                }
+            }
+            // `local found = table.find(t, x) ~= nil`.
+            RValue::Binary(binary)
+                if !inlinable_temp
+                    && binary.operation == BinaryOperation::NotEqual
+                    && ((matches!(&*binary.right, RValue::Literal(Literal::Nil))
+                        && matches!(&*binary.left, RValue::Call(c) | RValue::Select(Select::Call(c))
+                            if static_callee(c) == Some((Some("table"), "find"))))
+                        || (matches!(&*binary.left, RValue::Literal(Literal::Nil))
+                            && matches!(&*binary.right, RValue::Call(c) | RValue::Select(Select::Call(c))
+                                if static_callee(c) == Some((Some("table"), "find"))))) =>
+            {
+                self.set_hint_str(local, "found", 55);
+            }
+            // `local health = healthValue.Value` (ValueBase local dereference).
+            RValue::Index(index)
+                if !inlinable_temp && index_key(index) == Some("Value") =>
+            {
+                if let RValue::Local(wrapper) = &*index.left
+                    && let Some(wrapper_name) = self.local_known_name(wrapper)
+                    && let Some(stem) = wrapper_name.strip_suffix("Value")
+                    && stem.len() >= 2
+                    && let Some(name) = sanitize(stem)
+                {
+                    self.set_hint(local, name, 61);
+                }
             }
             // `local v = #x`: a length. Movable (Unary), so temp-gated.
             RValue::Unary(unary) if unary.operation == UnaryOperation::Length => {
@@ -4764,9 +5293,12 @@ impl Namer {
             return;
         }
         // A name-string API slot — but a name string can't be an Instance, so a
-        // contradicting instance use refuses it.
+        // contradicting instance use refuses it. Similarly, a dynamically-indexed
+        // value (`obj[method](obj)`) is polymorphic, not a pure `callback`.
         let api_name = if usage.api_slot_conflict || instance_shaped || is_instance_typeof {
             None
+        } else if usage.api_slot == Some("callback") && usage.dynamic_indexed {
+            Some("object")
         } else {
             usage.api_slot
         };
@@ -4860,7 +5392,14 @@ impl Namer {
             && !usage.length_taken
             && !usage.numeric_indexed
             && !usage.iterated;
+        // Uppercase Roblox vector components (`.X`, `.Y`, `.Z`) identify a
+        // vector parameter rather than a generic table record (`data`).
+        let vector_fields = table_shape
+            && !usage.field_written
+            && fields.len() >= 2
+            && fields.iter().all(|key| matches!(key.as_str(), "X" | "Y" | "Z"));
         let record_name = if table_shape
+            && !vector_fields
             && (fields.len() >= 3 || (fields.len() >= 2 && usage.field_written))
         {
             Some(if usage.field_written { "state" } else { "data" })
@@ -4871,6 +5410,9 @@ impl Namer {
 
         // The immutable `usage` borrow ends here; the `set_hint` calls take
         // `&mut self`. Scores arbitrate — order below is immaterial.
+        if vector_fields {
+            self.set_hint_str(param, "vector", 35);
+        }
         if let Some(name) = list_name {
             self.set_hint_str(param, name, 39);
         }
@@ -4950,14 +5492,25 @@ impl Namer {
         ) {
             return;
         }
-        let RValue::Index(index) = &*method_call.value else {
-            return;
-        };
-        let Some(event) = index_key(index) else {
-            return;
-        };
-        let Some(signature) = crate::naming_api::roblox_event_parameters(event) else {
-            return;
+        let signature: &'static [Option<&'static str>] = match &*method_call.value {
+            RValue::Index(index) => {
+                let Some(event) = index_key(index) else {
+                    return;
+                };
+                let Some(sig) = crate::naming_api::roblox_event_parameters(event) else {
+                    return;
+                };
+                sig
+            }
+            RValue::MethodCall(inner) | RValue::Select(Select::MethodCall(inner))
+                if matches!(
+                    inner.method.as_str(),
+                    "GetInstanceAddedSignal" | "GetInstanceRemovedSignal"
+                ) =>
+            {
+                &[Some("instance")]
+            }
+            _ => return,
         };
         let Some(RValue::Closure(closure)) = method_call.arguments.first() else {
             return;
@@ -5006,9 +5559,18 @@ impl Namer {
         }
     }
 
-    /// Name the two parameters of a `table.sort` comparator `a`/`b`, matching the
-    /// near-universal source convention for sort predicates.
+    /// Name the two parameters of a `table.sort` comparator `a`/`b`, and the
+    /// error-handler parameter of `xpcall(fn, function(err) ... end)`.
     fn comparator_hint(&mut self, call: &Call) {
+        if global_name(&call.value) == Some("xpcall")
+            && let Some(RValue::Closure(closure)) = call.arguments.get(1)
+        {
+            let function = closure.function.lock();
+            if let Some(param) = function.parameters.first() {
+                self.set_hint_str(param, "err", 50);
+            }
+            return;
+        }
         let RValue::Index(index) = &*call.value else {
             return;
         };
@@ -5282,6 +5844,7 @@ impl Namer {
                     Either::Right(RValue::Call(call))
                     | Either::Right(RValue::Select(Select::Call(call))) => {
                         self.comparator_hint(call);
+                        self.hint_dynamic_method_dispatch(call);
                     }
                     _ => {}
                 }
@@ -5321,9 +5884,7 @@ impl Namer {
                     .first()
                     .and_then(|p0| self.usage.get(&local_ptr(p0)))
                     .is_some_and(|usage| {
-                        !usage.string_fields_read.is_empty()
-                            || usage.field_written
-                            || usage.instance_method_seen
+                        !usage.string_fields_read.is_empty() || usage.field_written
                     });
                 // What a function named for what it gives (`getScanRoots`)
                 // returns on every path, a local of its own: `scanRoots`.
@@ -5347,14 +5908,46 @@ impl Namer {
                     self.collect_method_usage(method_call);
                     self.event_callback_hint(method_call)
                 }
-                Statement::Call(call) => self.comparator_hint(call),
+                Statement::Call(call) => {
+                    self.comparator_hint(call);
+                    self.hint_dynamic_method_dispatch(call);
+                }
                 Statement::Assign(assign) => {
                     for (right_index, rvalue) in assign.right.iter().enumerate() {
-                        if right_index + 1 == assign.right.len()
-                            && let RValue::Call(call) | RValue::Select(Select::Call(call)) = rvalue
+                        if right_index + 1 == assign.right.len() {
+                            if let RValue::Call(call) | RValue::Select(Select::Call(call)) = rvalue {
+                                self.apply_pcall_tuple_hints(assign, call, right_index);
+                                self.apply_use_state_tuple_hints(assign, call, right_index);
+                            }
+                            self.apply_api_tuple_hints(assign, rvalue, right_index);
+                        }
+                    }
+
+                    // Extract OOP class name from metatable error/className patterns, and
+                    // name well-known metamethod / setter / predicate closure parameters.
+                    for (lvalue, rvalue) in assign.left.iter().zip(&assign.right) {
+                        if let LValue::Index(index) = lvalue
+                            && let Some(key) = index_key(index)
                         {
-                            self.apply_pcall_tuple_hints(assign, call, right_index);
-                            self.apply_use_state_tuple_hints(assign, call, right_index);
+                            if let RValue::Closure(closure) = rvalue {
+                                self.hint_member_closure_params(key, closure);
+                            }
+                            if let RValue::Local(class_local) = &*index.left {
+                                if matches!(key, "__className" | "ClassName")
+                                    && let Some(name) = string_literal(rvalue)
+                                    && name.starts_with(|c: char| c.is_ascii_uppercase())
+                                    && name.contains(|c: char| c.is_ascii_lowercase())
+                                    && !crate::name_spelling::soft_reserved(name)
+                                    && let Some(name) = sanitize_preserve(name)
+                                {
+                                    self.set_hint(class_local, name, 75);
+                                } else if matches!(key, "__index" | "__newindex")
+                                    && let RValue::Closure(closure) = rvalue
+                                    && let Some(name) = class_name_from_metamethod(&closure.function.lock().body)
+                                {
+                                    self.set_hint(class_local, name, 75);
+                                }
+                            }
                         }
                     }
 
@@ -5372,6 +5965,17 @@ impl Namer {
                                 // takes that field's name.
                                 self.callback_hint(local);
                             }
+                            if is_root
+                                && assign.prefix
+                                && self.index_metamethod_locals.contains(&ptr)
+                                && matches!(
+                                    rvalue,
+                                    RValue::Call(c) | RValue::Select(Select::Call(c))
+                                        if global_name(&c.value) == Some("setmetatable")
+                                )
+                            {
+                                self.module_table_locals.insert(ptr);
+                            }
                             if let RValue::Table(table) = rvalue {
                                 if is_root && assign.prefix {
                                     self.module_table_locals.insert(local_ptr(local));
@@ -5379,36 +5983,49 @@ impl Namer {
                                 if !conflict && let Some(hint) = table_collection_hint(table) {
                                     self.set_hint(local, hint, 90);
                                 }
-                                // An EMPTY table later used as a metatable
-                                // (`setmetatable(_, X)`) or colon-
-                                // invoked (`X:method()`) is an OOP class table; name
-                                // it `class`. The empty-table gate is what makes the
-                                // (otherwise broad) class signals sound — a bare `{}`
-                                // that is metatable-/colon-used can only be a class.
-                                // Score 36 is far below the module name (100) and
-                                // collection (90), so a returned module class keeps
-                                // its script-derived name.
-                                //
-                                // NOTE: an empty `{}` IS `is_movable_single_value`
-                                // (vacuously — `.all()` over no entries), so a SINGLE-
-                                // USE empty-table temp WOULD be folded by the later
-                                // `inline_single_use_temps` (-1 line). Naming it `class`
-                                // makes `is_generated_temp` false and suppresses that
-                                // inline (+1 line). So additionally gate on it NOT being
-                                // that inline shape (`reads == 1 && writes == 1 &&
-                                // !captured`); a genuine class table is referenced by
-                                // its metatable / method defs / return, hence always
-                                // multi-use, so this never drops a real class (all 3
-                                // corpus sites keep `class`).
+                                // Extract explicit `__className = "Foo"` and metamethod/setter
+                                // parameter hints from inline table entries.
+                                for (k, v) in &table.0 {
+                                    if let Some(k) = k.as_ref().and_then(string_literal) {
+                                        if let RValue::Closure(closure) = v {
+                                            self.hint_member_closure_params(k, closure);
+                                        }
+                                        if matches!(k, "__className")
+                                            && let Some(name) = string_literal(v)
+                                            && name.starts_with(|c: char| c.is_ascii_uppercase())
+                                            && name.contains(|c: char| c.is_ascii_lowercase())
+                                            && !crate::name_spelling::soft_reserved(name)
+                                            && let Some(name) = sanitize_preserve(name)
+                                        {
+                                            self.set_hint(local, name, 75);
+                                        }
+                                    }
+                                }
+                                // A table later used as a metatable (`setmetatable(_, X)`)
+                                // or colon-invoked (`X:method()`) is an OOP class table; name
+                                // it `class`. Non-empty tables require both a metatable use
+                                // and an `__index` metamethod so plain data singletons
+                                // (`{ seed = 1 }`) and weak metatables (`{ __mode = "k" }`)
+                                // are never misnamed `class`.
                                 let inlinable_temp = self
                                     .counts
                                     .get(&local_ptr(local))
                                     .is_some_and(|u| u.reads == 1 && u.writes == 1 && !u.captured);
-                                if !conflict && table.0.is_empty()
-                                    && !inlinable_temp
-                                    && self.class_signal_locals.contains(&local_ptr(local))
-                                {
-                                    self.set_hint_str(local, "class", 36);
+                                let is_weak_meta = table.0.len() == 1
+                                    && table.0[0].0.as_ref().and_then(string_literal) == Some("__mode");
+                                let is_class_table = if table.0.is_empty() {
+                                    self.class_signal_locals.contains(&ptr)
+                                } else {
+                                    !is_weak_meta
+                                        && self.metatable_arg_locals.contains(&ptr)
+                                        && self.index_metamethod_locals.contains(&ptr)
+                                };
+                                if !conflict && !inlinable_temp {
+                                    if is_weak_meta {
+                                        self.set_hint_str(local, "weakMeta", 45);
+                                    } else if is_class_table {
+                                        self.set_hint_str(local, "class", 36);
+                                    }
                                 }
                             }
                             // RHS-derived naming must not fire on a
@@ -5549,12 +6166,20 @@ impl Namer {
                             _ => None,
                         })
                     });
+                    let key_name = self.collection_key_name(&generic_for.right);
+                    let array_like = names.is_none() && self.iterates_array_like_local(&generic_for.right);
                     for (index, res_local) in generic_for.res_locals.iter().enumerate() {
                         // Loop binders are not function parameters, but they can
                         // carry the same exact API-slot dataflow. In particular,
                         // `for _, name in ipairs({...}); FindFirstChild(name)`
                         // should expose that the iterated string is a child name.
                         self.api_slot_local_hint(res_local);
+                        if index == 0
+                            && let Some(key_name) = &key_name
+                        {
+                            self.set_hint(res_local, key_name.clone(), 46);
+                            continue;
+                        }
                         if index == 1
                             && let Some(element_name) = &element_name
                         {
@@ -5567,7 +6192,11 @@ impl Namer {
                         let base = names
                             .as_ref()
                             .and_then(|n| n.get(index).copied())
-                            .unwrap_or(if index == 0 { "k" } else { "v" });
+                            .unwrap_or(if index == 0 {
+                                if array_like { "i" } else { "k" }
+                            } else {
+                                "v"
+                            });
                         match base {
                             "child" | "descendant" => {
                                 self.set_context_hint_str(res_local, base, 45)
@@ -5599,10 +6228,57 @@ impl Namer {
         if is_root
             && let Some(module_hint) = self.module_hint.clone()
             && let Some(Statement::Return(ret)) = block.0.last()
-            && let [RValue::Local(local)] = ret.values.as_slice()
-            && self.module_table_locals.contains(&local_ptr(local))
+            && let [returned] = ret.values.as_slice()
         {
-            self.set_hint(local, module_hint, 100);
+            match returned {
+                RValue::Local(local) if self.module_table_locals.contains(&local_ptr(local)) => {
+                    self.set_hint(local, module_hint, 100);
+                }
+                other => {
+                    // Also handle thin wrapper exports: `return { new = Class.new }` or
+                    // `return table.freeze({ new = Class.new, Wrap = Class.Wrap, Is = Class.Is })`.
+                    let table = match other {
+                        RValue::Table(table) => Some(table),
+                        RValue::Call(call) | RValue::Select(Select::Call(call))
+                            if static_callee(call) == Some((Some("table"), "freeze")) =>
+                        {
+                            match call.arguments.as_slice() {
+                                [RValue::Table(table)] => Some(table),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(table) = table
+                        && !table.0.is_empty()
+                    {
+                        let mut target: Option<&RcLocal> = None;
+                        let mut consistent = true;
+                        for (k, v) in &table.0 {
+                            if k.as_ref().and_then(string_literal).is_some()
+                                && let RValue::Index(index) = v
+                                && let RValue::Local(cls) = &*index.left
+                                && self.module_table_locals.contains(&local_ptr(cls))
+                            {
+                                if let Some(prev) = target {
+                                    if local_ptr(prev) != local_ptr(cls) {
+                                        consistent = false;
+                                        break;
+                                    }
+                                } else {
+                                    target = Some(cls);
+                                }
+                            } else {
+                                consistent = false;
+                                break;
+                            }
+                        }
+                        if consistent && let Some(cls) = target {
+                            self.set_hint(cls, module_hint, 100);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -6066,6 +6742,92 @@ pub fn name_locals_with_evidence(
     name_locals_impl::<false>(block, rename, script_name, options, collect_evidence)
 }
 
+fn collect_metatable_and_index_locals(
+    block: &Block,
+    metatable_arg_locals: &mut FxHashSet<usize>,
+    index_metamethod_locals: &mut FxHashSet<usize>,
+) {
+    fn walk_rvalue(
+        value: &RValue,
+        metatable_arg_locals: &mut FxHashSet<usize>,
+        index_metamethod_locals: &mut FxHashSet<usize>,
+    ) {
+        match value {
+            RValue::Call(call) | RValue::Select(Select::Call(call)) => {
+                if global_name(&call.value) == Some("setmetatable")
+                    && let Some(RValue::Local(meta)) = call.arguments.get(1)
+                {
+                    metatable_arg_locals.insert(local_ptr(meta));
+                }
+            }
+            RValue::Closure(closure) => {
+                collect_metatable_and_index_locals(
+                    &closure.function.lock().body,
+                    metatable_arg_locals,
+                    index_metamethod_locals,
+                );
+            }
+            _ => {}
+        }
+        value.visit_rvalues(&mut |child| {
+            walk_rvalue(child, metatable_arg_locals, index_metamethod_locals);
+            true
+        });
+    }
+
+    for statement in block.iter() {
+        match statement {
+            Statement::Assign(assign) => {
+                for (left, right) in assign.left.iter().zip(&assign.right) {
+                    if let LValue::Index(index) = left
+                        && let RValue::Local(class_local) = &*index.left
+                        && index_key(index) == Some("__index")
+                    {
+                        index_metamethod_locals.insert(local_ptr(class_local));
+                    }
+                    if let LValue::Local(class_local) = left
+                        && let RValue::Table(table) = right
+                        && table
+                            .0
+                            .iter()
+                            .any(|(k, _)| k.as_ref().and_then(string_literal) == Some("__index"))
+                    {
+                        index_metamethod_locals.insert(local_ptr(class_local));
+                    }
+                }
+            }
+            Statement::Call(call) => {
+                if global_name(&call.value) == Some("setmetatable")
+                    && let Some(RValue::Local(meta)) = call.arguments.get(1)
+                {
+                    metatable_arg_locals.insert(local_ptr(meta));
+                }
+            }
+            Statement::If(branch) => {
+                collect_metatable_and_index_locals(&branch.then_block.lock(), metatable_arg_locals, index_metamethod_locals);
+                collect_metatable_and_index_locals(&branch.else_block.lock(), metatable_arg_locals, index_metamethod_locals);
+            }
+            Statement::While(node) => {
+                collect_metatable_and_index_locals(&node.block.lock(), metatable_arg_locals, index_metamethod_locals);
+            }
+            Statement::Repeat(node) => {
+                collect_metatable_and_index_locals(&node.block.lock(), metatable_arg_locals, index_metamethod_locals);
+            }
+            Statement::NumericFor(node) => {
+                collect_metatable_and_index_locals(&node.block.lock(), metatable_arg_locals, index_metamethod_locals);
+            }
+            Statement::GenericFor(node) => {
+                collect_metatable_and_index_locals(&node.block.lock(), metatable_arg_locals, index_metamethod_locals);
+            }
+            _ => {}
+        }
+        statement.visit_rvalues(&mut |value| {
+            walk_rvalue(value, metatable_arg_locals, index_metamethod_locals);
+            true
+        });
+    }
+}
+
 fn name_locals_impl<const REFERENCE: bool>(
     block: &mut Block, rename: bool, script_name: Option<&str>, options: NameLocalOptions,
     collect_evidence: bool,
@@ -6108,6 +6870,9 @@ fn name_locals_impl<const REFERENCE: bool>(
             if size { fact.buffer_size = true; } else { fact.repetition_count = true; }
         }
     }
+    let mut metatable_arg_locals = FxHashSet::default();
+    let mut index_metamethod_locals = FxHashSet::default();
+    collect_metatable_and_index_locals(block, &mut metatable_arg_locals, &mut index_metamethod_locals);
     let mut namer = Namer {
         rename,
         dont_reuse_var: options.dont_reuse_var,
@@ -6138,6 +6903,8 @@ fn name_locals_impl<const REFERENCE: bool>(
         at_root: false,
         collapse_candidates,
         class_signal_locals,
+        metatable_arg_locals,
+        index_metamethod_locals,
         root_spellings: FxHashMap::default(),
     };
     namer.collect(block, true);

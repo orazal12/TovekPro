@@ -162,17 +162,26 @@ fn conditional_assignment_parts(
     if !matches!(&assign.right[0], RValue::Binary(binary) if binary.operation == BinaryOperation::Or) {
         return None;
     }
-    if crate::expression_budget::collapse_allowed(&assign.right[0]) {
-        return None;
-    }
 
     let mut terms = Vec::new();
     collect_or_terms(&assign.right[0], &mut terms);
     let fallback = terms.pop()?;
-    // A single `condition and value or fallback` is still compact and familiar.
-    // The readability cliff starts at a chained selection with at least two
-    // conditions (the nested-if shape this recovery targets).
-    if terms.len() < 2 {
+    // A single `condition and value or fallback` is normally compact and familiar,
+    // EXCEPT when `value` is a multi-line closure literal (`c and function(...) ... end or fb`),
+    // where keeping the whole closure inside an `and/or` expression harms readability.
+    // Closures have zero traversal cost in `expression_budget`, so check this before
+    // `collapse_allowed`.
+    let single_closure_arm = terms.len() == 1
+        && matches!(
+            terms[0],
+            RValue::Binary(binary)
+                if binary.operation == BinaryOperation::And
+                    && matches!(&*binary.right, RValue::Closure(_))
+        );
+    if !single_closure_arm && crate::expression_budget::collapse_allowed(&assign.right[0]) {
+        return None;
+    }
+    if terms.len() < 2 && !single_closure_arm {
         return None;
     }
     for &term in &terms {
@@ -183,7 +192,10 @@ fn conditional_assignment_parts(
             return None;
         }
     }
-    if terms.len() < 3 && crate::expression_budget::expression_cost(fallback) < 10 {
+    if !single_closure_arm
+        && terms.len() < 3
+        && crate::expression_budget::expression_cost(fallback) < 10
+    {
         return None;
     }
     if assign.prefix && reads_rendered_name(&assign.right[0], local) {
@@ -883,5 +895,34 @@ mod tests {
 
         assert_eq!(block.0.len(), 201);
         assert!(matches!(block.0.last(), Some(crate::Statement::Return(_))));
+    }
+
+    #[test]
+    fn single_closure_arm_in_and_or_expands_to_if_else() {
+        let dest = RcLocal::new(Local::new(Some("handler".into())));
+        let cond = RcLocal::new(Local::new(Some("enabled".into())));
+        let fallback = RcLocal::new(Local::new(Some("defaultHandler".into())));
+        let closure = RValue::Closure(crate::Closure {
+            node_origin: Default::default(),
+            function: by_address::ByAddress(triomphe::Arc::new(parking_lot::Mutex::new(
+                crate::Function::default(),
+            ))),
+            upvalues: vec![],
+        });
+        let expr = Binary::new(
+            Binary::new(RValue::Local(cond), closure, BinaryOperation::And).into(),
+            RValue::Local(fallback),
+            BinaryOperation::Or,
+        )
+        .into();
+        let mut decl = Assign::new(vec![LValue::Local(dest)], vec![expr]);
+        decl.prefix = true;
+        let mut block = Block(vec![decl.into()]);
+
+        rebalance_expressions(&mut block);
+
+        let rendered = block.to_string();
+        assert!(rendered.contains("if enabled then"), "{rendered}");
+        assert!(rendered.contains("else"), "{rendered}");
     }
 }

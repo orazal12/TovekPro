@@ -92,10 +92,37 @@ pub fn spell_vector3_constants(body: &mut Block) {
     rewrite_block(body, Libraries { math: false, vector3: true });
 }
 
-/// `Vector3.new(x, y, z)`, or `-Vector3.new(-x, -y, -z)` when every component
-/// is negative or `-0` and one is `-0` (negation flips each sign bit, so the
-/// folded constant is the same bit for bit).
+/// `Vector3.new(x, y, z)`, or standard named vector constants (`Vector3.zero`,
+/// `Vector3.one`, `Vector3.xAxis`, `Vector3.yAxis`, `Vector3.zAxis`, and
+/// bit-exact negated axes `-Vector3.xAxis` / `-Vector3.yAxis` / `-Vector3.zAxis`)
+/// when `libraries.math && libraries.vector3` (`--assume-standard-libraries`),
+/// or `-Vector3.new(-x, -y, -z)` when every component is negative or `-0` and
+/// one is `-0` (negation flips each sign bit, so the folded constant is the
+/// same bit for bit).
 fn signed_vector3(components: [f64; 3], libraries: Libraries) -> RValue {
+    if libraries.math && libraries.vector3 {
+        const POS_ZERO: u64 = 0.0_f64.to_bits();
+        const NEG_ZERO: u64 = (-0.0_f64).to_bits();
+        const POS_ONE: u64 = 1.0_f64.to_bits();
+        const NEG_ONE: u64 = (-1.0_f64).to_bits();
+        match components.map(f64::to_bits) {
+            [POS_ZERO, POS_ZERO, POS_ZERO] => return library("Vector3", "zero"),
+            [POS_ONE, POS_ONE, POS_ONE] => return library("Vector3", "one"),
+            [POS_ONE, POS_ZERO, POS_ZERO] => return library("Vector3", "xAxis"),
+            [POS_ZERO, POS_ONE, POS_ZERO] => return library("Vector3", "yAxis"),
+            [POS_ZERO, POS_ZERO, POS_ONE] => return library("Vector3", "zAxis"),
+            [NEG_ONE, NEG_ZERO, NEG_ZERO] => {
+                return Unary::new(library("Vector3", "xAxis"), UnaryOperation::Negate).into();
+            }
+            [NEG_ZERO, NEG_ONE, NEG_ZERO] => {
+                return Unary::new(library("Vector3", "yAxis"), UnaryOperation::Negate).into();
+            }
+            [NEG_ZERO, NEG_ZERO, NEG_ONE] => {
+                return Unary::new(library("Vector3", "zAxis"), UnaryOperation::Negate).into();
+            }
+            _ => {}
+        }
+    }
     let component = |c: f64| spelled(&Literal::Number(c), libraries).unwrap_or_else(|| Literal::Number(c).into());
     let negated = components.iter().all(|c| c.is_sign_negative() && !c.is_nan())
         && components.iter().any(|c| *c == 0.0);

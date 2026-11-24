@@ -183,7 +183,7 @@ impl fmt::Display for Call {
             closure_observer: None,
             emission_map: None,
             layout_budget: None,
-            compact_annotations: false,
+            compact_annotations: false, clean_comments: false,
             inferred_calls: Default::default(),
         }
         .format_call(self)
@@ -266,7 +266,7 @@ impl fmt::Display for MethodCall {
             closure_observer: None,
             emission_map: None,
             layout_budget: None,
-            compact_annotations: false,
+            compact_annotations: false, clean_comments: false,
             inferred_calls: Default::default(),
         }
         .format_method_call(self)
