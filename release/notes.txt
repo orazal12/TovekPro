@@ -1,45 +1,29 @@
-Tovek V2.7 gives back more of what the Luau compiler took away, and decompiles
-every edge case we have found exactly.
+TovekPro V2.8 builds on Tovek V2.7 with major readability, semantic naming, OOP method recovery, control-flow, and formatting upgrades — plus a one-flag `--pro` / `PRO` preset for clean, human-readable Luau output.
 
-De-inlining
-- Copies Luau pasted into their callers come back as calls in more places:
-  helpers whose early return from a loop became a store and a break, copies
-  whose constants Luau folded through branches, locals and math.pow, copies
-  inside other copies, copies split by a declaration the caller evaluated in
-  between, and calls that forward their varargs.
-- Every rebuilt call is checked twice: the helper, specialized to the call's
-  constant arguments, must match the copy exactly, and evaluating the arguments
-  first must change nothing the copy observed. Where the bytecode's line
-  numbers show none of a helper's code in a function, a match there is code the
-  author wrote, and it stays as written.
-- Four real games (9,987 scripts): 8,474 -> 9,623 rebuilt helper calls.
+Highlights
+- New `--pro` CLI flag and `X-Decompile-Flags: PRO` server/WASM/Roblox client preset combining `compact_style`, `assume_standard_libraries`, `assume_no_nan`, and `clean_comments` (default mode stays 100% compatible with upstream semantics).
+- New `--clean-comments` / `CLEAN_COMMENTS` option to omit `-- inferred equivalent call`, helper counts, and diagnostic comments while keeping `--!native`.
+- Measured across 7 real Roblox scripts (Beacon, ClickToMoveController, Promise, Signal, SpawnShield, Store, Trove):
+  - Generic locals (`v*`): 582 -> 208 (-64.3%; Promise -77.4%, Store -88.5%, Signal -67.4%, Trove -100%)
+  - Generic parameters (`p*`): 86 -> 73 (-15.1%)
+  - Recovered OOP colon methods (`:fn`): 81 -> 108 (+33.3%; ClickToMoveController 24 -> 48)
+  - `not (a < b)` NaN guards (`--pro`): 2 -> 0 (-100%)
+  - `-- inferred` diagnostic comments (`--pro`): 79 -> 0 (-100%)
+  - Overlong lines (>120 columns, `--pro`): 14 -> 5 (-64.3%)
 
-Exactness
-- 341 edge-case fixtures at -O0, -O1 and -O2: 1,023 of 1,023
-  runs decompile, recompile and print what the original prints (V2.6.1: 965).
-- 658 review cases: 0 decompiled wrong (V2.6.1: 93).
-- 9,000 fresh typed fuzz programs: no wrong output. Hand-patched bytecode no
-  source can spell is refused, never printed as something else.
-- Table constructors keep their bytecode's allocation, so pairs visits keys in
-  the same order, including explicit array keys beside record keys.
+Semantic naming & OOP method recovery
+- Added 15+ Roblox event callback signatures (`Chatted`, `TouchTap*`, `MoveToFinished`, `HealthChanged`, `StateChanged`, `AttributeChanged`, `FocusLost`, `Mouse*`, etc.).
+- Class name recovery from `__className`, `ClassName`, and metatable error messages; `--script-name` support for subclasses (`setmetatable({}, Base)`) and wrapper exports (`return { new = Class.new }` / `table.freeze({ ... })`).
+- Rich Luau/Roblox idiom naming: `select("#", ...)` -> `argCount`, `{ ... }` -> `args`, `task.wait()` -> `dt`, `os.clock() - t` -> `elapsed`, vector deltas, `ValueBase.Value`, `rawget`, `newproxy`, `JSONEncode`/`JSONDecode`, `FindFirst*OfClass`/`WhichIsA`, multi-return tuples (`coroutine.resume`, `string.find`, `FindPartOnRay*`, `:await()`), metamethod/setter/predicate params (`__index`, `__newindex`, `SetFoo`, `.is`), and vector `.X/.Y/.Z` parameters.
+- Second-pass class-consistency OOP method recovery with per-prefix static dot-call scoping, constructor-table field harvesting, and `.prototype` member recovery.
 
-Names and presentation
-- Names from evidence for rebuilt calls, running extremes, sets, collection
-  elements, stored clock readings and documented Roblox APIs. Four games:
-  generated names 60,491 -> 58,668; output 1.5% shorter.
-- Guard clauses, bottom-tested loops and one-shot loops read as written; do
-  blocks keep their scope; Roblox vector constants print as Vector3.new.
+Control flow, expressions & formatting
+- Positive equality guard merging emits `if a == 1 or a == 2 then` instead of double-negated `if not (a ~= 1 and a ~= 2) then`.
+- Expands single-closure `cond and function(...) ... end or fallback` back to clean `if/else`.
+- NaN-safe De Morgan in guard negation, multi-arm boolean `if/elseif/else` short-circuit folding, terminal `else` lifting after returning guards, windowed liveness in `copy_cleanup`, clean forward declarations for self-capturing connections and branch-initialized locals, exact `Vector3` named constants (`Vector3.zero`, `one`, `xAxis`, `yAxis`, `zAxis`), and improved line wrapping for long binary arguments and `and`/`or` chains.
 
-Scale
-- Long functions no longer grow passes quadratically, and the HTTP server
-  streams large batches and returns memory when idle. Decompile time on the
-  four games is about the same as V2.6.1.
+Downloads: Windows x86_64, Linux x86_64, Linux aarch64, and macOS (Apple silicon).
+Each package contains `luau-lifter` (CLI), `web-server` (local HTTP server), and `LICENSE.txt`. `SHA256SUMS.txt` lists the checksums.
 
-Downloads: Windows x86_64, Linux x86_64, Linux aarch64 and macOS (Apple silicon).
-Each package contains luau-lifter (CLI), web-server (local HTTP server), and the
-MIT licence. SHA256SUMS.txt lists the checksums.
-
-Release notes: https://kiet1308.github.io/Tovek/changelog/v2.7/
-Film: https://kiet1308.github.io/Tovek/watch/?film=v27
-Usage: https://github.com/Kiet1308/Tovek/blob/main/README.md
-Source: https://github.com/Kiet1308/Tovek/tree/v2.7
+Usage: https://github.com/orazal12/TovekPro/blob/main/README.md
+Source: https://github.com/orazal12/TovekPro/tree/v2.8

@@ -74,15 +74,15 @@ def main():
     server = (args.bin_dir / ('web-server' + suffix)).resolve()
     assert cli.is_file() and server.is_file(), 'both binaries are required'
     reported = subprocess.check_output([str(cli), '--version'], text=True).strip()
-    assert reported == f'luau-lifter {display}', reported
+    assert reported == f'TovekPro {display}', reported
     subprocess.run([str(cli), '--help'], check=True, stdout=subprocess.DEVNULL, timeout=30)
     fixture = ROOT / 'luau-lifter/tests/fixtures/cache_context.luaubc'
     output = subprocess.check_output([str(cli), str(fixture)], timeout=30)
     assert b'function Module.Read(' in output and b'return Module' in output, 'CLI fixture smoke test failed'
     smoke_server(server, fixture.read_bytes(), output)
-    name = f"Tovek-{display.replace(' ', '-')}-{args.platform}"
+    name = f"TovekPro-{display.replace(' ', '-')}-{args.platform}"
     args.out.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='tovek-release-') as temp:
+    with tempfile.TemporaryDirectory(prefix='tovekpro-release-') as temp:
         package = pathlib.Path(temp) / name
         package.mkdir()
         # The binaries alone, plus the MIT licence they must carry.

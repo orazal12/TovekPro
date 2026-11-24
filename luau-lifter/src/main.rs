@@ -23,7 +23,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser, Debug)]
-#[command(name = "TovekPro", about = "TovekPro — ultra-readable, high-performance Luau decompiler", version = "TovekPro V2.7", author)]
+#[command(name = "TovekPro", about = "TovekPro — ultra-readable, high-performance Luau decompiler", version = "V2.8", author)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
